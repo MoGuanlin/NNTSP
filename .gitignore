@@ -1,0 +1,61 @@
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# ===== Logs / Outputs =====
+logs/
+log/
+*.log
+outputs/
+output/
+runs/
+wandb/
+tensorboard/
+
+# ===== Data / Models / Checkpoints (often large) =====
+data/
+dataset/
+datasets/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# ===== Archives / binaries =====
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+*.bin
+
+# ===== Large media =====
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.png
+*.jpg
+*.jpeg
+
+# ===== PDFs (optional) =====
+*.pdf

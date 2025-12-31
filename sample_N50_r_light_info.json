@@ -1,0 +1,19 @@
+{
+  "input": "data/N50/train_r_light_pyramid.pt",
+  "num_samples_in_input": 200,
+  "index": 0,
+  "saved_single": "sample_N50_r_light.pt",
+  "saved_list": "sample_N50_r_light_list.pt",
+  "summary": {
+    "fields": [
+      "_edge_attr_cls",
+      "_store",
+      "_tensor_attr_cls"
+    ],
+    "field_info": {
+      "_edge_attr_cls": "<class 'type'>",
+      "_store": "<class 'torch_geometric.data.storage.GlobalStorage'>",
+      "_tensor_attr_cls": "<class 'type'>"
+    }
+  }
+}
