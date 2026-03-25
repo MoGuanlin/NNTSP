@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
     from .node_token_packer import PackedNodeTokens
 
 
-@dataclass(frozen=True)
+@dataclass
 class EdgeScores:
     edge_logit: Tensor   # [E]
     edge_mask: Tensor    # [E] bool (True for edges that appear in tokens)
@@ -45,16 +45,28 @@ def infer_num_edges_from_tokens(tokens: PackedNodeTokens) -> int:
     return mx + 1
 
 
-def aggregate_cross_logits_to_edges(
+def aggregate_logits_to_edges(
     *,
     tokens: PackedNodeTokens,
     cross_logit: Tensor,           # [M,Tc]
+    iface_logit: Tensor | None = None, # [M,Ti]
+    reduce: str = "amax",
     fill_value: float = float("-inf"),
+    num_edges: int | None = None,
 ) -> EdgeScores:
     """
-    Aggregate cross logits into per-edge logits using cross_eid.
+    Aggregate cross (and optionally iface) logits into per-edge logits.
 
-    Uses amax reduction to be robust to accidental duplicates.
+    Args:
+      tokens: PackedNodeTokens containing eid mappings.
+      cross_logit: Logits for crossing tokens.
+      iface_logit: Optional logits for interface tokens.
+      reduce: Reduction method ("amax" or "mean").
+      fill_value: Initial value for edge_logit.
+      num_edges: Optional explicit total number of edges. If None, inferred from tokens.
+                 CRITICAL: When using r-light pruning, some high-index edges might not be covered 
+                 by any tokens. In such cases, inferring from tokens will underestimate E, 
+                 causing downstream shape mismatches. Always provide this if known.
 
     Returns:
       EdgeScores(edge_logit=[E], edge_mask=[E])
@@ -64,37 +76,76 @@ def aggregate_cross_logits_to_edges(
             f"cross_logit must match tokens.cross_eid shape {tuple(tokens.cross_eid.shape)}, got {tuple(cross_logit.shape)}"
         )
 
-    E = infer_num_edges_from_tokens(tokens)
+    E_inferred = infer_num_edges_from_tokens(tokens)
+    if num_edges is not None:
+        E = int(num_edges)
+        if E < E_inferred:
+            raise ValueError(f"Provided num_edges={E} is less than inferred max eid+1={E_inferred}.")
+    else:
+        E = E_inferred
+
     device = cross_logit.device
-    edge_logit = torch.full((E,), fill_value=fill_value, device=device, dtype=cross_logit.dtype)
+    
+    # Initialization Differentiation:
+    # - For "amax": We start with -inf (fill_value) so that any real logit will replace it.
+    # - For "mean": We start with 0.0. Note that if we use include_self=False later, 
+    #   this 0.0 is just a placeholder and won't affect the average calculation.
+    init_val = 0.0 if reduce == "mean" else fill_value
+    edge_logit = torch.full((E,), fill_value=init_val, device=device, dtype=cross_logit.dtype)
     edge_mask = torch.zeros((E,), device=device, dtype=torch.bool)
     if E == 0:
         return EdgeScores(edge_logit=edge_logit, edge_mask=edge_mask)
 
-    m = tokens.cross_mask.bool() & (tokens.cross_eid >= 0)
-    if not m.any().item():
+    # 1. Gather crossing evidence
+    m_c = tokens.cross_mask.bool() & (tokens.cross_eid >= 0)
+    eid_list = [tokens.cross_eid[m_c].long()]
+    val_list = [cross_logit[m_c]]
+    
+    # 2. Gather interface evidence (optional)
+    if iface_logit is not None:
+        if iface_logit.dim() != 2 or iface_logit.shape != tokens.iface_mask.shape:
+            raise ValueError(
+                f"iface_logit must match tokens.iface_mask shape {tuple(tokens.iface_mask.shape)}, got {tuple(iface_logit.shape)}"
+            )
+        m_i = tokens.iface_mask.bool() & (tokens.iface_eid >= 0)
+        eid_list.append(tokens.iface_eid[m_i].long())
+        val_list.append(iface_logit[m_i])
+
+    if not any(e.numel() > 0 for e in eid_list):
         return EdgeScores(edge_logit=edge_logit, edge_mask=edge_mask)
 
-    eid = tokens.cross_eid[m].long()          # [K]
-    val = cross_logit[m]                      # [K]
+    eid = torch.cat(eid_list, dim=0)
+    val = torch.cat(val_list, dim=0)
     edge_mask[eid] = True
 
-    # scatter-reduce amax (PyTorch 2.0+)
+    # scatter-reduce (PyTorch 2.0+)
+    # Logic for include_self:
+    # - For "amax": inclusive_self=True is used because -inf is the identity element for max.
+    # - For "mean": inclusive_self=False is CRITICAL. If True, the initial 0.0 would be 
+    #   treated as an additional data point, biasing the average towards zero.
     try:
-        edge_logit = edge_logit.scatter_reduce(0, eid, val, reduce="amax", include_self=True)
+        edge_logit = edge_logit.scatter_reduce(0, eid, val, reduce=reduce, include_self=(reduce != "mean"))
     except Exception:
-        # Fallback: sort by eid then take max per group.
+        # Fallback: sort by eid then reduce per group.
         order = torch.argsort(eid)
         eid_s = eid[order]
         val_s = val[order]
         diff = torch.ones_like(eid_s, dtype=torch.bool)
         diff[1:] = eid_s[1:] != eid_s[:-1]
         starts = torch.nonzero(diff, as_tuple=False).view(-1)
-        for si, sj in zip(starts.tolist(), starts.tolist()[1:] + [eid_s.numel()]):
+        for i in range(len(starts)):
+            si = int(starts[i].item())
+            sj = int(starts[i+1].item()) if i+1 < len(starts) else eid_s.numel()
             e = int(eid_s[si].item())
-            edge_logit[e] = val_s[si:sj].max()
+            if reduce == "amax":
+                edge_logit[e] = val_s[si:sj].max()
+            elif reduce == "mean":
+                edge_logit[e] = val_s[si:sj].mean()
 
     return EdgeScores(edge_logit=edge_logit, edge_mask=edge_mask)
 
 
-__all__ = ["EdgeScores", "infer_num_edges_from_tokens", "aggregate_cross_logits_to_edges"]
+# Alias for backward compatibility
+aggregate_cross_logits_to_edges = aggregate_logits_to_edges
+
+__all__ = ["EdgeScores", "infer_num_edges_from_tokens", "aggregate_logits_to_edges", "aggregate_cross_logits_to_edges"]

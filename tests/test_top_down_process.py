@@ -1,4 +1,4 @@
-# src/test/test_top_down_process.py
+# tests/test_top_down_process.py
 # -*- coding: utf-8 -*-
 """
 End-to-end correctness test for the *top-down* DP-aligned pipeline (Contract v2).
@@ -8,7 +8,7 @@ This test runs:
 and then aggregates per-node crossing logits into per-edge logits using cross_eid.
 
 Usage:
-  python src/test/test_top_down_process.py --data_pt data/N50/train_r_light_pyramid.pt --idx 0 --r 4 --device cuda
+  python tests/test_top_down_process.py --data_pt data/N50/train_r_light_pyramid.pt --idx 0 --r 4 --device cuda
 
 Notes / Expectations:
 - Token shapes are scale-invariant: Ti=4r, Smax=4r, Tc is constant cap (e.g., 8r) unless overridden.
@@ -35,7 +35,7 @@ import torch
 
 def _add_repo_root_to_syspath() -> None:
     here = Path(__file__).resolve()
-    repo_root = here.parents[2]
+    repo_root = here.parents[1]
     sys.path.insert(0, str(repo_root))
 
 

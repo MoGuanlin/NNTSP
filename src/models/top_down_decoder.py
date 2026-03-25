@@ -34,7 +34,7 @@ All token lengths are O(1) in N, hence fully scale-invariant.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -42,11 +42,12 @@ from torch import Tensor
 
 from .set_transformer_block import FeedForward, SetTransformerBlock
 from .tokenization import NodeTokenizer
+from .bc_state_catalog import state_logits_to_expected_iface_usage
 
 Mode = Literal["two_stage", "one_stage"]
 
 
-@dataclass(frozen=True)
+@dataclass
 class TopDownDecoderOutput:
     """
     iface_logit:       local per-node iface logits            [B, Ti]
@@ -57,6 +58,7 @@ class TopDownDecoderOutput:
     iface_logit: Tensor
     cross_logit: Tensor
     child_iface_logit: Tensor
+    child_state_logit: Optional[Tensor]
     aux: Dict[str, Tensor]
 
 
@@ -158,6 +160,8 @@ class TopDownDecoderModule(nn.Module):
         max_depth: int = 64,
         use_angle_sincos: bool = True,
         mode: Mode = "two_stage",
+        state_mode: str = "iface",
+        num_states: int | None = None,
         bc_clip: float = 20.0,
         return_aux: bool = False,
     ) -> None:
@@ -174,11 +178,17 @@ class TopDownDecoderModule(nn.Module):
             raise ValueError("max_depth must be positive.")
         if mode not in ("two_stage", "one_stage"):
             raise ValueError(f"Unknown mode: {mode}")
+        if state_mode not in ("iface", "matching"):
+            raise ValueError(f"Unknown state_mode: {state_mode}")
+        if state_mode == "matching" and (num_states is None or int(num_states) <= 0):
+            raise ValueError("num_states must be positive when state_mode='matching'.")
         if bc_clip <= 0:
             raise ValueError("bc_clip must be positive.")
 
         self.d_model = int(d_model)
         self.mode: Mode = mode
+        self.state_mode = str(state_mode)
+        self.num_states = None if num_states is None else int(num_states)
         self.bc_clip = float(bc_clip)
         self.return_aux = bool(return_aux)
 
@@ -239,6 +249,11 @@ class TopDownDecoderModule(nn.Module):
 
         # Child boundary-condition head (per child iface token)
         self.child_iface_head = nn.Linear(d_model, 1)
+        self.child_state_head = (
+            nn.Linear(d_model, self.num_states)
+            if self.state_mode == "matching"
+            else None
+        )
 
     # -----------------------------
     # Helpers: safe categorical embedding
@@ -377,6 +392,10 @@ class TopDownDecoderModule(nn.Module):
         child_iface_boundary_dir: Tensor,      # [B,4,Ti] long
         child_iface_inside_endpoint: Tensor,   # [B,4,Ti] long
         child_iface_inside_quadrant: Tensor,   # [B,4,Ti] long
+        bc_in_state_logit: Optional[Tensor] = None,  # [B,S]
+        state_mask: Optional[Tensor] = None,         # [B,S] bool
+        state_used_iface: Optional[Tensor] = None,   # [S,Ti] bool
+        child_state_mask: Optional[Tensor] = None,   # [B,4,S] bool
     ) -> TopDownDecoderOutput:
         B = int(node_feat_rel.shape[0])
         if node_feat_rel.shape != (B, 4):
@@ -406,6 +425,27 @@ class TopDownDecoderModule(nn.Module):
         if child_exists_mask.shape != (B, 4):
             raise ValueError(f"child_exists_mask must be [B,4], got {tuple(child_exists_mask.shape)}")
 
+        if self.state_mode == "matching":
+            if bc_in_state_logit is None or state_mask is None or state_used_iface is None or child_state_mask is None:
+                raise ValueError("matching mode requires bc_in_state_logit/state_mask/state_used_iface/child_state_mask.")
+            if bc_in_state_logit.dim() != 2:
+                raise ValueError("bc_in_state_logit must be [B,S].")
+            if state_mask.shape != bc_in_state_logit.shape:
+                raise ValueError("state_mask must match bc_in_state_logit.")
+            if child_state_mask.dim() != 3 or child_state_mask.shape[:2] != (B, 4):
+                raise ValueError("child_state_mask must be [B,4,S].")
+            if child_state_mask.shape[2] != bc_in_state_logit.shape[1]:
+                raise ValueError("child_state_mask must share S with bc_in_state_logit.")
+            if state_used_iface.dim() != 2 or state_used_iface.shape != (bc_in_state_logit.shape[1], Ti):
+                raise ValueError("state_used_iface must be [S,Ti] and match bc_in_state_logit/iface slots.")
+            bc_expected = state_logits_to_expected_iface_usage(
+                state_logit=bc_in_state_logit,
+                state_mask=state_mask.bool(),
+                state_used_iface=state_used_iface,
+            )
+        else:
+            bc_expected = bc_in_iface_logit
+
         # ---- A) parent memory tokenization (CLS + IFACE + CROSS + CHILD) ----
         mem = self.tokenizer(
             node_feat_rel=node_feat_rel,
@@ -430,7 +470,7 @@ class TopDownDecoderModule(nn.Module):
         tokens[:, cls_idx, :] = tokens[:, cls_idx, :] + self.z_node_proj(z_node)
 
         # inject bc_in into parent IFACE tokens
-        bc = bc_in_iface_logit.to(dtype=tokens.dtype)
+        bc = bc_expected.to(dtype=tokens.dtype)
         bc = torch.where(iface_mask.bool(), bc, torch.zeros_like(bc))
         bc = torch.clamp(bc, -self.bc_clip, self.bc_clip)
         bc_emb = self.bc_proj(bc.unsqueeze(-1))  # [B,Ti,d]
@@ -493,6 +533,18 @@ class TopDownDecoderModule(nn.Module):
             child_iface_logit_flat = self.child_iface_head(q).squeeze(-1)  # [B,4Ti]
 
         child_iface_logit = child_iface_logit_flat.reshape(B, 4, Ti)
+        child_state_logit: Optional[Tensor] = None
+
+        if self.state_mode == "matching":
+            assert self.child_state_head is not None
+            child_feat = (child_x if self.mode == "one_stage" else q).reshape(B, 4, Ti, self.d_model)
+            child_valid = child_tok_mask.bool()
+            denom = child_valid.sum(dim=2, keepdim=True).clamp_min(1).to(dtype=child_feat.dtype)
+            child_summary = (child_feat * child_valid.unsqueeze(-1).to(dtype=child_feat.dtype)).sum(dim=2) / denom
+            child_state_logit = self.child_state_head(child_summary)  # [B,4,S]
+            valid_state_mask = child_state_mask.bool()
+            neg_inf_state = torch.tensor(self._NEG_INF, device=child_state_logit.device, dtype=child_state_logit.dtype)
+            child_state_logit = torch.where(valid_state_mask, child_state_logit, neg_inf_state)
 
         # mask child logits
         valid_child_iface = child_tok_mask.bool()  # already AND with child_exists
@@ -511,6 +563,7 @@ class TopDownDecoderModule(nn.Module):
             iface_logit=iface_logit,
             cross_logit=cross_logit,
             child_iface_logit=child_iface_logit,
+            child_state_logit=child_state_logit,
             aux=aux,
         )
 

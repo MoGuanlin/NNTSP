@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class LossOut:
     loss: Tensor
     parts: Dict[str, Tensor]
@@ -55,6 +55,36 @@ def masked_bce_with_logits(
 
     if not torch.isfinite(loss).item():
         raise RuntimeError("masked_bce_with_logits produced NaN/Inf.")
+    return loss
+
+
+def masked_ce_with_logits(
+    logit: Tensor,
+    target: Tensor,
+    mask: Tensor,
+) -> Tensor:
+    """
+    Multi-class cross-entropy over a masked subset.
+
+    Args:
+      logit:  [N,C] float
+      target: [N] long
+      mask:   [N] bool
+    """
+    if logit.dim() != 2:
+        raise ValueError(f"logit must be [N,C], got {tuple(logit.shape)}")
+    if target.shape != logit.shape[:1]:
+        raise ValueError(f"target must be [N], got {tuple(target.shape)} for logit {tuple(logit.shape)}")
+    if mask.shape != target.shape:
+        raise ValueError(f"mask must match target shape, got {tuple(mask.shape)} vs {tuple(target.shape)}")
+
+    m = mask.bool() & (target >= 0)
+    if not m.any().item():
+        return logit.new_tensor(0.0)
+
+    loss = F.cross_entropy(logit[m], target[m].long(), reduction="mean")
+    if not torch.isfinite(loss).item():
+        raise RuntimeError("masked_ce_with_logits produced NaN/Inf.")
     return loss
 
 
@@ -193,6 +223,7 @@ def top_down_losses(
 __all__ = [
     "LossOut",
     "masked_bce_with_logits",
+    "masked_ce_with_logits",
     "dp_token_losses",
     "bc_child_iface_losses",
     "top_down_losses",

@@ -1,10 +1,11 @@
-# src/graph/prune_pyramid.py
 import torch
 import argparse
+import numpy as np
 import os
 from tqdm import tqdm
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
+from torch.utils.data import Dataset, DataLoader
 
 try:
     from torch_geometric.data import Data
@@ -13,6 +14,8 @@ except ImportError:
         def __init__(self, **kwargs):
             for k, v in kwargs.items():
                 setattr(self, k, v)
+        def to_dict(self):
+            return self.__dict__
 
 
 # boundary_dir encoding:
@@ -298,14 +301,83 @@ def prune_r_light_single(raw: Data, r: int, debug: bool = False) -> Data:
 
     return new_data
 
+# --- End of prune_r_light_single body ---
 
-def prune_dataset(input_path: str, output_path: str, r: int, debug: bool = False) -> None:
-    raw_list: List[Data] = _safe_torch_load(input_path)
-    pruned_list: List[Data] = []
 
-    print(f"Loaded raw pyramid list: {len(raw_list)} samples")
-    for raw in tqdm(raw_list):
-        pruned_list.append(prune_r_light_single(raw, r=r, debug=debug))
+class PruneDataset(Dataset):
+    def __init__(self, raw_list_np: List[Dict], r: int, debug: bool):
+        self.raw_list_np = raw_list_np
+        self.r = r
+        self.debug = debug
+
+    def __len__(self):
+        return len(self.raw_list_np)
+
+    def __getitem__(self, b: int):
+        raw_dict = self.raw_list_np[b]
+        
+        # Reconstruct Data for the worker locally
+        raw = Data()
+        for k, v in raw_dict.items():
+            setattr(raw, k, torch.from_numpy(v) if isinstance(v, np.ndarray) else v)
+            
+        data = prune_r_light_single(raw, r=self.r, debug=self.debug)
+        
+        # Convert back to numpy dict for safe return
+        res = {}
+        for k, v in (data.to_dict() if hasattr(data, "to_dict") else data.__dict__).items():
+            if torch.is_tensor(v):
+                res[k] = v.detach().cpu().numpy().copy()
+            else:
+                res[k] = v
+        
+        # NUCLEAR OPTION: Pickle to bytes to force single-blob IPC.
+        #
+        # [Technical Analysis]
+        # Previous mmap errors were caused by PyTorch/DataLoader attempting to manage shared memory
+        # handles for thousands of small Numpy arrays/Tensors.
+        # By pickling to bytes here, we force the IPC to treat the result as a single opaque blob,
+        # dramatically reducing the system call overhead and file descriptor usage.
+        import pickle
+        return pickle.dumps(res)
+
+
+def prune_dataset(input_path: str, output_path: str, r: int, num_workers: int = 1, debug: bool = False) -> None:
+    raw_list = _safe_torch_load(input_path)
+    
+    print(f"Loaded raw pyramid list: {len(raw_list)} samples. Converting to numpy for stable IPC...")
+    raw_list_np = []
+    for raw in raw_list:
+        d = {k: (v.detach().cpu().numpy().copy() if torch.is_tensor(v) else v) for k, v in (raw.to_dict() if hasattr(raw, "to_dict") else raw.__dict__).items()}
+        raw_list_np.append(d)
+    del raw_list # Free memory
+    
+    print(f"Pruning with {num_workers} workers (batch_size=50)...")
+    
+    dataset = PruneDataset(raw_list_np, r, debug)
+    loader = DataLoader(
+        dataset,
+        batch_size=50, 
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn=lambda x: x 
+    )
+
+    pruned_list = []
+    import pickle
+    pbar = tqdm(total=len(raw_list_np), desc="Pruning")
+    for batch in loader:
+        for data_bytes in batch:
+            data_dict = pickle.loads(data_bytes)
+            data = Data()
+            for k, v in data_dict.items():
+                if isinstance(v, np.ndarray):
+                    setattr(data, k, torch.from_numpy(v))
+                else:
+                    setattr(data, k, v)
+            pruned_list.append(data)
+            pbar.update(1)
+    pbar.close()
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     torch.save(pruned_list, output_path)
@@ -317,7 +389,8 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=True, help="Input *_raw_pyramid.pt")
     parser.add_argument("--output", type=str, required=True, help="Output *_r_light_pyramid.pt")
     parser.add_argument("--r", type=int, default=5, help="Per-(node,boundary) interface cap")
+    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    prune_dataset(args.input, args.output, r=args.r, debug=args.debug)
+    prune_dataset(args.input, args.output, r=args.r, num_workers=args.num_workers, debug=args.debug)

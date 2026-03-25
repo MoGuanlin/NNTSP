@@ -1,4 +1,4 @@
-# src/test/test_bottom_up_process.py
+# tests/test_bottom_up_process.py
 # -*- coding: utf-8 -*-
 """
 End-to-end correctness test for the bottom-up DP-aligned pipeline (Contract v2).
@@ -12,7 +12,7 @@ Differences from the older test:
   - angle expected in [-1,1] (angle/pi)
 
 Usage:
-  python src/test/test_bottom_up_process.py --data_pt data/N50/train_r_light_pyramid.pt --idx 0 --r 4 --device cuda
+  python tests/test_bottom_up_process.py --data_pt data/N50/train_r_light_pyramid.pt --idx 0 --r 4 --device cuda
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import torch
 
 def _add_repo_root_to_syspath() -> None:
     here = Path(__file__).resolve()
-    repo_root = here.parents[2]
+    repo_root = here.parents[1]
     sys.path.insert(0, str(repo_root))
 
 

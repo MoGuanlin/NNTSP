@@ -1,4 +1,4 @@
-# src/test/test_decode_tour.py
+# tests/test_decode_tour.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ import torch
 
 def _add_repo_root_to_syspath() -> None:
     """
-    When running `python src/test/xxx.py`, sys.path[0] is `src/test`,
+    When running `python tests/xxx.py`, sys.path[0] is `tests`,
     so repo root is NOT importable. Add it explicitly.
     """
     here = Path(__file__).resolve()
-    repo_root = here.parents[2]  # .../NNTSP
+    repo_root = here.parents[1]  # .../NNTSP
     sys.path.insert(0, str(repo_root))
 
 

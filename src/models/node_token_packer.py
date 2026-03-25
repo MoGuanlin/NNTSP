@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
+
+try:
+    from src.models.bc_state_catalog import BoundaryStateCatalog, build_boundary_state_catalog, state_mask_from_iface_mask
+except Exception:  # pragma: no cover
+    from .bc_state_catalog import BoundaryStateCatalog, build_boundary_state_catalog, state_mask_from_iface_mask
 
 
 # -----------------------------
 # Dataclasses
 # -----------------------------
 
-@dataclass(frozen=True)
+@dataclass
 class PackedLeafPoints:
     """
     Leaf-level point sets, packed with a fixed cap max_points_per_leaf.
@@ -30,7 +35,25 @@ class PackedLeafPoints:
     point_xy: Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
+class PackedStateCatalog:
+    """
+    Batch-shared boundary-state catalog for matching mode.
+
+    Shapes:
+      used_iface: [S, Ti] bool
+      mate:       [S, Ti] long
+      num_used:   [S] long
+    """
+
+    used_iface: Tensor
+    mate: Tensor
+    num_used: Tensor
+    empty_index: int
+    max_used: int
+
+
+@dataclass
 class PackedNodeTokens:
     """
     Per-tree-node packed tokens (padded). Leading dim is num_tree_nodes M (or total_M for batch).
@@ -53,11 +76,14 @@ class PackedNodeTokens:
       iface_inside_quadrant: [M, Ti] long
 
     Crossing (Tc cap):
-      cross_mask:             [M, Tc] bool
-      cross_eid:              [M, Tc] long (batch-global eid after pack_batch offset)
-      cross_feat6:            [M, Tc, 6] float
-      cross_child_pair:       [M, Tc, 2] long
-      cross_is_leaf_internal: [M, Tc] bool
+    cross_mask:             [M, Tc] bool
+    cross_eid:              [M, Tc] long (batch-global eid after pack_batch offset)
+    cross_feat6:            [M, Tc, 6] float
+    cross_child_pair:       [M, Tc, 2] long
+    cross_is_leaf_internal: [M, Tc] bool
+
+    Matching-state catalog mask (optional):
+      state_mask:            [M, S] bool
     """
     tree_node_feat_rel: Tensor
     tree_node_depth: Tensor
@@ -79,9 +105,10 @@ class PackedNodeTokens:
     cross_feat6: Tensor
     cross_child_pair: Tensor
     cross_is_leaf_internal: Tensor
+    state_mask: Optional[Tensor] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class PackedBatch:
     """
     Batch-level packed structure.
@@ -93,6 +120,7 @@ class PackedBatch:
     graph_id_for_node: [total_M] mapping node -> graph id
     tokens: PackedNodeTokens
     leaves: PackedLeafPoints
+    state_catalog: optional PackedStateCatalog shared across batch
     """
     node_ptr: Tensor
     leaf_ptr: Tensor
@@ -100,6 +128,7 @@ class PackedBatch:
     graph_id_for_node: Tensor
     tokens: PackedNodeTokens
     leaves: PackedLeafPoints
+    state_catalog: Optional[PackedStateCatalog] = None
 
 
 # -----------------------------
@@ -290,17 +319,25 @@ class NodeTokenPacker:
         self,
         r: int | None = None,
         *,
+        state_mode: str = "iface",
+        matching_max_used: int = 4,
         max_iface_per_node: int | None = None,
         max_cross_per_node: int | None = None,
         max_points_per_leaf: int = 20,
     ) -> None:
         self.r = None if r is None else int(r)
+        self.state_mode = str(state_mode)
+        self.matching_max_used = int(matching_max_used)
         self.max_iface_per_node = None if max_iface_per_node is None else int(max_iface_per_node)
         self.max_cross_per_node = None if max_cross_per_node is None else int(max_cross_per_node)
         self.max_points_per_leaf = int(max_points_per_leaf)
 
         if self.r is not None and self.r <= 0:
             raise ValueError("r must be positive.")
+        if self.state_mode not in {"iface", "matching"}:
+            raise ValueError(f"Unknown state_mode: {self.state_mode}")
+        if self.matching_max_used <= 0:
+            raise ValueError("matching_max_used must be positive.")
         if self.max_points_per_leaf <= 0:
             raise ValueError("max_points_per_leaf must be positive.")
 
@@ -474,6 +511,7 @@ class NodeTokenPacker:
             cross_feat6=cross_out["feat6"],
             cross_child_pair=cross_out["pair"],
             cross_is_leaf_internal=cross_out["leaf_internal"].to(dtype=torch.bool),
+            state_mask=None,
         )
 
         return tokens, leaves, M, L, E, root_id_local, root_scale_s
@@ -548,9 +586,26 @@ class NodeTokenPacker:
         point_idx_all: List[Tensor] = []
         point_mask_all: List[Tensor] = []
         point_xy_all: List[Tensor] = []
+        state_mask_all: List[Tensor] = []
 
         root_id_global = torch.empty((B,), dtype=torch.long, device=device)
         root_scale_s = torch.tensor(root_scales, dtype=torch.float32, device=device)
+
+        state_catalog: Optional[PackedStateCatalog] = None
+        if self.state_mode == "matching":
+            Ti = int(single_tokens[0].iface_mask.shape[1])
+            catalog = build_boundary_state_catalog(
+                num_slots=Ti,
+                max_used=self.matching_max_used,
+                device=device,
+            )
+            state_catalog = PackedStateCatalog(
+                used_iface=catalog.used_iface,
+                mate=catalog.mate,
+                num_used=catalog.num_used,
+                empty_index=int(catalog.empty_index),
+                max_used=int(catalog.max_used),
+            )
 
         for b in range(B):
             t = single_tokens[b]
@@ -584,6 +639,14 @@ class NodeTokenPacker:
             cross_pair_all.append(t.cross_child_pair)
             cross_leafint_all.append(t.cross_is_leaf_internal)
             cross_eid_all.append(torch.where(t.cross_eid >= 0, t.cross_eid + off_e, t.cross_eid))
+
+            if state_catalog is not None:
+                state_mask_all.append(
+                    state_mask_from_iface_mask(
+                        iface_mask=t.iface_mask.bool(),
+                        state_used_iface=state_catalog.used_iface,
+                    )
+                )
 
             # leaves
             if int(l.leaf_node_id.numel()) > 0:
@@ -629,6 +692,7 @@ class NodeTokenPacker:
             cross_feat6=torch.cat(cross_feat6_all, dim=0),
             cross_child_pair=torch.cat(cross_pair_all, dim=0),
             cross_is_leaf_internal=torch.cat(cross_leafint_all, dim=0),
+            state_mask=torch.cat(state_mask_all, dim=0) if state_mask_all else None,
         )
 
         return PackedBatch(
@@ -638,4 +702,5 @@ class NodeTokenPacker:
             graph_id_for_node=graph_id_for_node,
             tokens=tokens,
             leaves=leaves,
+            state_catalog=state_catalog,
         )

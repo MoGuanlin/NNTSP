@@ -4,7 +4,33 @@ import argparse
 import os
 from scipy.spatial import Delaunay
 from time import time
-from typing import Tuple
+from typing import Tuple, List
+from torch.utils.data import Dataset, DataLoader
+
+class SpannerDataset(Dataset):
+    def __init__(self, points_np: np.ndarray, mode: str, build_fn):
+        self.points_np = points_np
+        self.mode = mode
+        self.build_fn = build_fn
+        self.N = points_np.shape[1]
+
+    def __len__(self):
+        return self.points_np.shape[0]
+
+    def __getitem__(self, b: int):
+        p = self.points_np[b]
+        if self.mode == 'delaunay':
+            edges = self.build_fn(p)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+        
+        # Local results
+        offset = b * self.N
+        edges_offset = (edges + offset).copy()
+        num_edges = edges.shape[1]
+        b_ids = np.full((num_edges,), b, dtype=np.int64)
+        # Return as numpy to avoid PyTorch shared memory / mmap limits in some environments (e.g. Docker)
+        return edges_offset, b_ids
 
 class SpannerBuilder:
     """
@@ -19,12 +45,13 @@ class SpannerBuilder:
     def __init__(self, mode: str = 'delaunay'):
         self.mode = mode
 
-    def build_batch(self, points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def build_batch(self, points: torch.Tensor, num_workers: int = 1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         处理整个 Batch 的点集。
 
         Args:
             points: [B, N, 2] 坐标张量 (Float or Int)
+            num_workers: 并行核心数
 
         Returns:
             edge_index: [2, E_total] 无向边索引 (LongTensor, u < v).
@@ -38,28 +65,26 @@ class SpannerBuilder:
         # Scipy 不支持 GPU，转到 CPU numpy
         points_np = points.detach().cpu().float().numpy()
 
-        edge_lists = []
-        batch_ids = []
-
-        print(f"Building {self.mode} spanner for {B} samples (N={N}) [UNDIRECTED] ...")
+        print(f"Building {self.mode} spanner for {B} samples (N={N}) [UNDIRECTED] (workers={num_workers}) ...")
         t0 = time()
 
-        for b in range(B):
-            p = points_np[b]  # [N, 2]
+        # Use a moderate batch_size
+        dataset = SpannerDataset(points_np, self.mode, self._build_delaunay_topology)
+        loader = DataLoader(
+            dataset, 
+            batch_size=min(128, max(1, B // (num_workers * 2))) if num_workers > 1 else B,
+            num_workers=num_workers,
+            shuffle=False,
+            collate_fn=lambda x: x  # list of tuples
+        )
 
-            if self.mode == 'delaunay':
-                edges = self._build_delaunay_topology(p)   # [2, E_local], undirected u<v
-            else:
-                raise ValueError(f"Unknown mode: {self.mode}")
-
-            # batch offset
-            offset = b * N
-            edges_offset = edges + offset
-
-            edge_lists.append(torch.from_numpy(edges_offset))
-
-            num_edges = edges.shape[1]
-            batch_ids.append(torch.full((num_edges,), b, dtype=torch.long))
+        edge_lists = []
+        batch_ids = []
+        
+        for batch in loader:
+            for e_off_np, b_idx_np in batch:
+                edge_lists.append(torch.from_numpy(e_off_np))
+                batch_ids.append(torch.from_numpy(b_idx_np))
 
         print(f"Topology build time: {time() - t0:.4f}s")
 
@@ -133,7 +158,7 @@ class SpannerBuilder:
 
         return edges.T.astype(np.int64)
 
-def process_dataset(input_path, output_path):
+def process_dataset(input_path, output_path, num_workers: int = 1):
     print(f"Loading data from {input_path}...")
     try:
         data = torch.load(input_path)
@@ -144,7 +169,7 @@ def process_dataset(input_path, output_path):
     print(f"Data shape: {data.shape}")  # [B, N, 2]
 
     builder = SpannerBuilder(mode='delaunay')
-    edge_index, edge_attr, batch_idx = builder.build_batch(data)
+    edge_index, edge_attr, batch_idx = builder.build_batch(data, num_workers=num_workers)
 
     # stats (UNDIRECTED)
     num_samples = data.shape[0]
@@ -172,6 +197,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Construct Spanner Graphs from Points")
     parser.add_argument("--input", type=str, required=True, help="Path to input .pt file (from data_generator)")
     parser.add_argument("--output", type=str, required=True, help="Path to output .pt file")
+    parser.add_argument("--num_workers", type=int, default=1)
 
     args = parser.parse_args()
-    process_dataset(args.input, args.output)
+    process_dataset(args.input, args.output, num_workers=args.num_workers)

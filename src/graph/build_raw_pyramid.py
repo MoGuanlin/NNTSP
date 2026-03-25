@@ -1,4 +1,3 @@
-# src/graph/build_raw_pyramid.py
 import torch
 import numpy as np
 import argparse
@@ -6,6 +5,7 @@ import os
 from tqdm import tqdm
 import math
 from typing import List, Tuple, Dict, Optional
+from torch.utils.data import Dataset, DataLoader
 
 # 尝试导入 PyG Data，如果没有则使用 Mock
 try:
@@ -17,6 +17,8 @@ except ImportError:
                 setattr(self, k, v)
         def __repr__(self):
             return f"Data(num_nodes={getattr(self, 'num_nodes', 'N/A')})"
+        def to_dict(self):
+            return self.__dict__
 
 
 # Quadrant order (fixed):
@@ -631,33 +633,107 @@ class RawPyramidBuilder:
         return lca, path_u_segment, path_v_segment
 
 
-def build_raw_dataset(input_path, output_path, max_points, max_depth):
+
+
+class RawPyramidDataset(Dataset):
+    def __init__(self, all_points, all_edges, all_edge_attrs, batch_idx, N, max_points, max_depth):
+        self.all_points = all_points
+        self.all_edges = all_edges
+        self.all_edge_attrs = all_edge_attrs
+        self.batch_idx = batch_idx
+        self.N = N
+        self.max_points = max_points
+        self.max_depth = max_depth
+
+    def __len__(self):
+        return self.all_points.shape[0]
+
+    def __getitem__(self, b: int):
+        mask = (self.batch_idx == b)
+        points_np = self.all_points[b].astype(np.float32)
+        edges_np = self.all_edges[:, mask] - (b * self.N)
+        attrs_np = self.all_edge_attrs[mask]
+
+        # Use builder as before, but with torch tensors created locally in the worker
+        points_t = torch.from_numpy(points_np)
+        edges_t = torch.from_numpy(edges_np.astype(np.int64))
+        attrs_t = torch.from_numpy(attrs_np)
+
+        builder = RawPyramidBuilder(max_points_per_leaf=self.max_points, max_depth=self.max_depth)
+        data = builder.process_sample(points_t, edges_t, attrs_t)
+        
+        # Convert Data object to a dictionary of numpy arrays
+        # Use .copy() to ensure we detach from any shared storage
+        res = {}
+        for k, v in (data.to_dict() if hasattr(data, "to_dict") else data.__dict__).items():
+            if torch.is_tensor(v):
+                res[k] = v.detach().cpu().numpy().copy()
+            else:
+                res[k] = v
+        
+        # NUCLEAR OPTION: Pickle to bytes to force single-blob IPC.
+        #
+        # [Technical Analysis of previous RuntimeError: unable to mmap ...]
+        # 1. Problem: In Docker/Linux environments, PyTorch's DataLoader uses shared memory (shm) 
+        #    to transfer Tensors between worker processes and the main process.
+        # 2. Bottleneck: Our 'Data' objects contain many small Tensors/Arrays. When processing 
+        #    batches of 50-100 samples with 16 workers, the system attempts to create thousands 
+        #    of individual memory mappings (mmaps) or file descriptors simultaneously.
+        # 3. Limitation: This explodes the OS limit (vm.max_map_count or open files), causing 
+        #    "Cannot allocate memory" errors even if RAM is plentiful.
+        # 4. Solution: We manually serialize (pickle) the entire dictionary of arrays into a 
+        #    single 'bytes' object BEFORE returning it.
+        # 5. Result: The IPC mechanism now sees only ONE opaque object per sample (or batch), 
+        #    reducing the number of mmaps/FDs by orders of magnitude (e.g., from 10,000 to 100).
+        #    This makes the pipeline robust even in resource-constrained containers.
+        import pickle
+        return pickle.dumps(res)
+
+
+def build_raw_dataset(input_path, output_path, max_points, max_depth, num_workers=1):
     print(f"[Step 1] Loading Spanner Graph from {input_path}...")
     try:
         data_dict = torch.load(input_path)
     except Exception:
         data_dict = torch.load(input_path, weights_only=False)
 
-    all_points = data_dict['points']         # [B, N, 2]
-    all_edges = data_dict['edge_index']      # [2, E_total] (undirected, disjoint union)
-    all_edge_attrs = data_dict['edge_attr']  # [E_total, 1]
-    batch_idx = data_dict['batch_idx']       # [E_total]
+    # Convert everything to numpy right away to avoid any shared tensor descriptors in workers
+    all_points = data_dict['points'].detach().cpu().numpy()         # [B, N, 2]
+    all_edges = data_dict['edge_index'].detach().cpu().numpy()      # [2, E_total]
+    all_edge_attrs = data_dict['edge_attr'].detach().cpu().numpy()  # [E_total, 1]
+    batch_idx = data_dict['batch_idx'].detach().cpu().numpy()       # [E_total]
 
     num_samples = all_points.shape[0]
     N = all_points.shape[1]
+
+    print(f"Configuring Builder: max_points={max_points}, max_depth={max_depth}, workers={num_workers}")
+    
+    dataset = RawPyramidDataset(all_points, all_edges, all_edge_attrs, batch_idx, N, max_points, max_depth)
+    loader = DataLoader(
+        dataset,
+        batch_size=50,  # Moderate batch size
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn=lambda x: x # Return list of bytes
+    )
+
     processed_list = []
-
-    print(f"Configuring Builder: max_points={max_points}, max_depth={max_depth}")
-    builder = RawPyramidBuilder(max_points_per_leaf=max_points, max_depth=max_depth)
-
-    for b in tqdm(range(num_samples)):
-        mask = (batch_idx == b)
-        points = all_points[b].to(torch.float32)
-        edges = all_edges[:, mask] - (b * N)  # shift back to 0-based
-        attrs = all_edge_attrs[mask]
-
-        data = builder.process_sample(points, edges, attrs)
-        processed_list.append(data)
+    import pickle
+    # Wrap tqdm manually to show progress in samples
+    pbar = tqdm(total=num_samples, desc="Building Pyramid")
+    for batch in loader:
+        for data_bytes in batch:
+            data_dict = pickle.loads(data_bytes)
+            # Reconstruct Data object from numpy dictionary
+            data = Data()
+            for k, v in data_dict.items():
+                if isinstance(v, np.ndarray):
+                    setattr(data, k, torch.from_numpy(v))
+                else:
+                    setattr(data, k, v)
+            processed_list.append(data)
+            pbar.update(1)
+    pbar.close()
 
     print(f"Saving Raw Pyramid Dataset to {output_path}...")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -671,6 +747,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, required=True, help="Output *_raw_pyramid.pt")
     parser.add_argument("--max_points", type=int, default=20, help="Max points per leaf node (Termination condition)")
     parser.add_argument("--max_depth", type=int, default=20, help="Max tree depth (Termination condition)")
+    parser.add_argument("--num_workers", type=int, default=1)
     args = parser.parse_args()
 
-    build_raw_dataset(args.input, args.output, args.max_points, args.max_depth)
+    build_raw_dataset(args.input, args.output, args.max_points, args.max_depth, num_workers=args.num_workers)

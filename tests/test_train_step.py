@@ -1,4 +1,4 @@
-# src/test/test_train_step.py
+# tests/test_train_step.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch
 
 def _add_repo_root_to_syspath() -> None:
     here = Path(__file__).resolve()
-    repo_root = here.parents[2]
+    repo_root = here.parents[1]
     sys.path.insert(0, str(repo_root))
 
 
@@ -101,7 +101,7 @@ def main() -> None:
     from src.models.losses import dp_token_losses
 
     # batch edge aggregation
-    from src.models.edge_aggregation import aggregate_cross_logits_to_edges
+    from src.models.edge_aggregation import aggregate_logits_to_edges
 
     obj = _torch_load(args.data_pt, map_location="cpu")
     if not isinstance(obj, list) or len(obj) == 0:
@@ -123,7 +123,7 @@ def main() -> None:
     decoder = _instantiate_best_effort(TopDownDecoder, {"r": int(args.r), "d_model": 128}).to(device)
     td = _instantiate_best_effort(TopDownTreeRunner, {})
 
-    labeler = PseudoLabeler(two_opt_passes=30, prefer_cpu=True)
+    labeler = PseudoLabeler(two_opt_passes=30, use_lkh=False, prefer_cpu=True)
 
     batch = packer.pack_batch(datas)
     batch = _packed_batch_to_device(batch, device)
@@ -224,7 +224,12 @@ def main() -> None:
     print(f"[ok] train step loss={float(loss_out.loss.item()):.6f} parts={parts_str}")
 
     # batch edge aggregation (now valid because eids are global-unique)
-    edge_scores = aggregate_cross_logits_to_edges(tokens=batch.tokens, cross_logit=out_td.cross_logit)
+    edge_scores = aggregate_logits_to_edges(
+        tokens=batch.tokens, 
+        cross_logit=out_td.cross_logit,
+        iface_logit=out_td.iface_logit,
+        reduce="mean"
+    )
     edge_logit = edge_scores.edge_logit
     edge_mask = edge_scores.edge_mask.bool()
     print(f"[edge] global edge_logit.shape={tuple(edge_logit.shape)}, edges_covered={int(edge_mask.sum().item())}")

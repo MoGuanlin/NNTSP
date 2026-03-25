@@ -30,7 +30,7 @@ import torch.nn as nn
 from torch import Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class TokenizedNodeMemory:
     tokens: Tensor
     mask: Tensor

@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class Tour:
     """
     A Hamiltonian cycle represented by an ordering of vertices.
@@ -80,28 +80,81 @@ def two_opt_improve(order: Tensor, D: Tensor, max_passes: int = 50) -> Tensor:
     if N < 4:
         return order
 
-    order = order.clone()
-    best_len = float(tour_length(order, D).item())
+    N = int(order.numel())
+    if N < 4:
+        return order
 
-    for _ in range(max_passes):
+    order_list = order.tolist()
+    D_np = D.detach().cpu().numpy()
+    
+    # For large N, use candidate-restricted 2-opt to keep it O(KN)
+    use_candidate = (N > 500)
+    top_indices = None
+    if use_candidate:
+        K = 20
+        _, topk_indices = torch.topk(D, k=min(K+1, N), dim=1, largest=False)
+        top_indices = topk_indices[:, 1:].cpu().numpy().tolist()
+
+    pos_in_tour = [0] * N
+    for idx, node in enumerate(order_list):
+        pos_in_tour[node] = idx
+
+    max_p = max_passes if N < 1000 else min(max_passes, 20)
+    
+    for _ in range(max_p):
         improved = False
-        # 2-opt: reverse segment (i..j)
-        for i in range(1, N - 2):
-            a = int(order[i - 1].item())
-            b = int(order[i].item())
-            for j in range(i + 1, N - 1):
-                c = int(order[j].item())
-                d = int(order[j + 1].item())
-                # delta = (a-b + c-d) replaced by (a-c + b-d)
-                delta = float(D[a, c].item() + D[b, d].item() - D[a, b].item() - D[c, d].item())
-                if delta < -1e-12:
-                    order[i : j + 1] = torch.flip(order[i : j + 1], dims=[0])
-                    best_len += delta
-                    improved = True
+        for i in range(N):
+            u = order_list[i]
+            v_idx = (i + 1) % N
+            v = order_list[v_idx]
+            d_uv = D_np[u][v]
+
+            if use_candidate:
+                # Optimized KN search
+                for w in top_indices[u]:
+                    if w == u or w == v: continue
+                    idx_w = pos_in_tour[w]
+                    idx_x = (idx_w + 1) % N
+                    x = order_list[idx_x]
+                    if x == u or x == v: continue
+                    
+                    if d_uv + D_np[w][x] > D_np[u][w] + D_np[v][x] + 1e-9:
+                        if i < idx_w:
+                            start, end = i + 1, idx_w + 1
+                            order_list[start:end] = order_list[start:end][::-1]
+                            for k in range(start, end):
+                                pos_in_tour[order_list[k]] = k
+                        else:
+                            start, end = idx_x, i + 1
+                            order_list[start:end] = order_list[start:end][::-1]
+                            for k in range(start, end):
+                                pos_in_tour[order_list[k]] = k
+                        v = w
+                        d_uv = D_np[u][v]
+                        improved = True
+            else:
+                # Standard N^2 search for small instances
+                for j in range(i + 2, N):
+                    if i == 0 and j == N - 1: continue
+                    w = order_list[j]
+                    x_idx = (j + 1) % N
+                    x = order_list[x_idx]
+                    
+                    if d_uv + D_np[w][x] > D_np[u][w] + D_np[v][x] + 1e-9:
+                        # reverse segment from v to w
+                        # i < j always true here
+                        start, end = i + 1, j + 1
+                        order_list[start:end] = order_list[start:end][::-1]
+                        for k in range(start, end):
+                            pos_in_tour[order_list[k]] = k
+                        v = w
+                        d_uv = D_np[u][v]
+                        improved = True
+                        
         if not improved:
             break
 
-    return order
+    return torch.tensor(order_list, dtype=torch.long, device=order.device)
 
 
 def solve_tsp_heuristic(

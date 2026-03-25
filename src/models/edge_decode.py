@@ -10,14 +10,17 @@ import torch
 from torch import Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class TourDecodeResult:
     order: List[int]                 # Hamiltonian cycle order, length N, starts at 0 by convention
     length: float                    # Euclidean tour length on pos
     feasible: bool                   # degree=2 and single cycle
     num_off_spanner_edges: int       # how many edges not in spanner were used in patching
-    num_edges_broken: int            # how many edges were removed to break subtours
     num_components_initial: int       # components after greedy selection
+    num_edges_broken: int            # legacy: how many edges were removed to break subtours (should be 0)
+    fallback_used: bool              # whether nearest-neighbor fallback was used
+    num_patching_steps: int          # how many edges added in patching phase
+    duration: float                  # execution time in seconds
 
 
 class _DSU:
@@ -105,6 +108,10 @@ def decode_tour_from_edge_logits(
 
     This is a postprocessing heuristic (engineering approximation), NOT DP backtracking.
     """
+    import heapq
+    import time
+    start_t = time.time()
+
     if pos.dim() != 2 or pos.shape[1] != 2:
         raise ValueError(f"pos must be [N,2], got {tuple(pos.shape)}")
     if spanner_edge_index.dim() != 2 or spanner_edge_index.shape[0] != 2:
@@ -159,47 +166,36 @@ def decode_tour_from_edge_logits(
         dsu.union(a, b)
         chosen[_edge_key(a, b)] = score
 
-    chosen_edges = 0
+    chosen_edges_count = 0
     for score, a, b in edges:
-        if chosen_edges >= N:
+        if chosen_edges_count >= N:
             break
-        if can_add(a, b, chosen_edges):
-            add_edge(a, b, score)
-            chosen_edges += 1
-            if chosen_edges == N:
+        # CORRECTED CONDITION: Only allow cycle if it covers all nodes
+        ra, rb = dsu.find(a), dsu.find(b)
+        if deg[a] < 2 and deg[b] < 2:
+            if ra != rb:
+                add_edge(a, b, score)
+                chosen_edges_count += 1
+            elif chosen_edges_count == N - 1 and dsu.sz[ra] == N:
+                # This is the final closing edge for the full Hamiltonian cycle
+                add_edge(a, b, score)
+                chosen_edges_count += 1
                 break
 
-    def component_nodes() -> Dict[int, List[int]]:
-        d = _DSU(N)
-        for (a, b) in chosen.keys():
-            d.union(a, b)
-        return d.groups()
-
-    comps0 = component_nodes()
-    num_components_initial = len(comps0)
-
-    # break premature cycles (component is a cycle but not full graph)
-    num_edges_broken = 0
-    for _root, nodes in list(comps0.items()):
-        if len(nodes) == N:
-            continue
-        if all(deg[x] == 2 for x in nodes):
-            node_set = set(nodes)
-            best_key = None
-            best_score = 1e100
-            for (a, b), sc in chosen.items():
-                if a in node_set and b in node_set and sc < best_score:
-                    best_score = sc
-                    best_key = (a, b)
-            if best_key is not None:
-                a, b = best_key
-                chosen.pop(_edge_key(a, b), None)
-                adj[a].remove(b)
-                adj[b].remove(a)
-                deg[a] -= 1
-                deg[b] -= 1
-                chosen_edges -= 1
-                num_edges_broken += 1
+    # After initial greedy, we might have multiple components (paths)
+    # maintain endpoints incrementally instead of recomputing
+    endpoints: set[int] = {i for i in range(N) if deg[i] < 2}
+    # component_id -> list of endpoint nodes
+    comp_to_eps: Dict[int, List[int]] = {}
+    for i in endpoints:
+        root = dsu.find(i)
+        comp_to_eps.setdefault(root, []).append(i)
+    
+    num_components_initial = len(comp_to_eps)
+    fallback_used = False
+    num_patching_steps = 0
+    num_off_spanner_patching = 0
+    num_edges_broken = 0 # Legacy
 
     p_cpu = pos.detach().cpu()
 
@@ -208,147 +204,186 @@ def decode_tour_from_edge_logits(
         dy = float(p_cpu[a, 1].item() - p_cpu[b, 1].item())
         return (dx * dx + dy * dy) ** 0.5
 
-    num_off_spanner = 0
+    # --- PATCHING PHASE ---
+    # We maintain comp_to_eps (component_id -> list of nodes with deg < 2)
+    # until only one component remains.
+    
+    def get_dist(a: int, b: int) -> float:
+        dx = float(p_cpu[a, 0].item() - p_cpu[b, 0].item())
+        dy = float(p_cpu[a, 1].item() - p_cpu[b, 1].item())
+        return (dx * dx + dy * dy) ** 0.5
 
-    def add_connection(a: int, b: int) -> bool:
-        nonlocal chosen_edges, num_off_spanner
-        if deg[a] >= 2 or deg[b] >= 2:
-            return False
-        key = _edge_key(a, b)
-        in_sp = key in sp_set
-        if (not in_sp) and (not allow_off_spanner_patch):
-            return False
-
-        # score for patch edges: use spanner logit if spanner, otherwise negative distance
-        sc = sp_logit.get(key, -dist(a, b))
-        add_edge(a, b, sc)
-        chosen_edges += 1
-        if not in_sp:
-            num_off_spanner += 1
-        return True
-
-    def get_endpoints(nodes: List[int]) -> List[int]:
-        # nodes with free degree slots (deg < 2)
-        return [x for x in nodes if deg[x] < 2]
-
-    # Patch components until connected
-    while True:
-        comps = component_nodes()
-        if len(comps) == 1:
-            break
-
-        comp_list: List[Tuple[List[int], List[int]]] = []  # (nodes, endpoints)
-        for _r, nodes in comps.items():
-            eps = get_endpoints(nodes)
-            # if eps empty, it's a cycle; break its weakest edge and recompute eps
-            if len(eps) == 0 and len(nodes) < N:
-                node_set = set(nodes)
-                best_key = None
-                best_score = 1e100
-                for (a, b), sc in chosen.items():
-                    if a in node_set and b in node_set and sc < best_score:
-                        best_score = sc
-                        best_key = (a, b)
-                if best_key is not None:
-                    a, b = best_key
-                    chosen.pop(_edge_key(a, b), None)
-                    adj[a].remove(b)
-                    adj[b].remove(a)
-                    deg[a] -= 1
-                    deg[b] -= 1
-                    chosen_edges -= 1
-                    num_edges_broken += 1
-                eps = get_endpoints(nodes)
-            comp_list.append((nodes, eps))
-
-        # Choose best inter-component connection:
-        #   - if prefer_spanner_only: first search for ANY spanner edge between endpoints, choose max logit
-        #   - otherwise (or if none exists): choose closest endpoints (off-spanner allowed if enabled)
-        best_sp = None  # (logit, a, b)
-        best_off = None  # (dist, a, b)
-
-        for i in range(len(comp_list)):
-            nodes_i, eps_i = comp_list[i]
-            if len(eps_i) == 0:
-                continue
-            set_i = set(nodes_i)
-            for j in range(i + 1, len(comp_list)):
-                nodes_j, eps_j = comp_list[j]
-                if len(eps_j) == 0:
-                    continue
-                set_j = set(nodes_j)
-
-                # scan endpoint pairs
+    # PRE-OPTIMIZATION: The first greedy pass already exhausts useful spanner edges.
+    # We only need to merge remaining components using off-spanner edges if allowed.
+    
+    if len(comp_to_eps) > 1 and allow_off_spanner_patch:
+        while len(comp_to_eps) > 1:
+            best_off = None # (dist, a, b, target_root)
+            min_patch_dist = float('inf')
+            
+            # Optimization: Instead of O(C^2) to find the absolute best among all pairs,
+            # just pick one component and find its nearest neighbor in any other component.
+            # This makes the total patching phase O(C^2) instead of O(C^3).
+            roots = list(comp_to_eps.keys())
+            r_i = roots[0]
+            eps_i = comp_to_eps[r_i]
+            
+            for j in range(1, len(roots)):
+                r_j = roots[j]
                 for a in eps_i:
-                    if deg[a] >= 2:
-                        continue
-                    for b in eps_j:
-                        if deg[b] >= 2:
-                            continue
-                        key = _edge_key(a, b)
-                        if key in sp_set:
-                            sc = sp_logit[key]
-                            if best_sp is None or sc > best_sp[0]:
-                                best_sp = (sc, a, b)
-                        else:
-                            d_ab = dist(a, b)
-                            if best_off is None or d_ab < best_off[0]:
-                                best_off = (d_ab, a, b)
-
-        if best_sp is not None:
-            _, a, b = best_sp
-            if not add_connection(a, b):
-                break
-        else:
-            if not allow_off_spanner_patch:
-                break
-            if best_off is None:
-                break
-            _, a, b = best_off
-            if not add_connection(a, b):
+                    for b in comp_to_eps[r_j]:
+                        d = get_dist(a, b)
+                        if d < min_patch_dist:
+                            min_patch_dist = d
+                            best_off = (d, a, b, r_j)
+            
+            if best_off:
+                d, a, b, r_j = best_off
+                add_edge(a, b, -d)
+                chosen_edges_count += 1
+                num_patching_steps += 1
+                num_off_spanner_patching += 1
+                
+                # Update DSU and component map
+                dsu.union(a, b)
+                new_root = dsu.find(a)
+                eps_merged = comp_to_eps.pop(r_i) + comp_to_eps.pop(r_j)
+                comp_to_eps[new_root] = [x for x in eps_merged if deg[x] < 2]
+            else:
                 break
 
-    # Close a single path to a cycle if needed
-    endpoints = [i for i in range(N) if deg[i] < 2]
-    if len(component_nodes()) == 1 and len(endpoints) == 2:
-        a, b = endpoints
-        add_connection(a, b)
+    # Final closure if only 2 endpoints left in one component
+    if len(comp_to_eps) == 1:
+        root = next(iter(comp_to_eps))
+        eps = comp_to_eps[root]
+        if len(eps) == 2:
+            a, b = eps
+            key = _edge_key(a, b)
+            if key not in sp_set:
+                num_off_spanner_patching += 1
+            add_edge(a, b, sp_logit.get(key, -get_dist(a, b)))
+            chosen_edges_count += 1
+            num_patching_steps += 1
+            comp_to_eps[root] = []
 
-    feasible = all(d == 2 for d in deg) and (len(component_nodes()) == 1) and (len(chosen) == N)
+    feasible = (chosen_edges_count == N) and (all(d == 2 for d in deg)) and (len(comp_to_eps) == 1)
     order = _extract_cycle_order(adj, start=0) if feasible else None
 
     if order is None:
-        # fallback: nearest neighbor order (evaluation-only)
-        nn_order = [0]
-        used = [False] * N
-        used[0] = True
-        cur = 0
-        for _ in range(N - 1):
-            best_j = None
-            best_d = 1e100
-            for j in range(N):
-                if not used[j]:
-                    dj = dist(cur, j)
-                    if dj < best_d:
-                        best_d = dj
-                        best_j = j
-            assert best_j is not None
-            nn_order.append(best_j)
-            used[best_j] = True
-            cur = best_j
-        order = nn_order
+        # fallback: use existing torch-vectorized heuristic (NN + 2-opt)
+        from src.models.tour_solver import solve_tsp_heuristic
+        tour_h = solve_tsp_heuristic(pos, start=0, max_2opt_passes=50)
+        order = tour_h.order.tolist()
+        length = float(tour_h.length.item())
         feasible = False
-
-    length = _tour_length(pos, order)
+        fallback_used = True
+    else:
+        # OPTIONAL: Candidate-restricted 2-opt refinement
+        from src.models.tour_solver import pairwise_dist
+        D_full = pairwise_dist(pos).detach().cpu().numpy()
+        N = D_full.shape[0]
+        
+        # Candidate-restricted 2-opt (Fast O(KN))
+        # Increase K for better quality. For large N, we cap this to preserve speed.
+        K = 40 if N < 1000 else 20
+        _, topk_indices = torch.topk(torch.from_numpy(D_full), k=min(K+1, N), dim=1, largest=False)
+        top_indices = topk_indices[:, 1:].numpy().tolist() # remove self
+        
+        curr_order = list(order)
+        pos_in_tour = [0] * N
+        for idx, node in enumerate(curr_order):
+            pos_in_tour[node] = idx
+            
+        improved = True
+        passes = 0
+        max_passes = 100 if N < 1000 else 30
+        while improved and passes < max_passes:
+            improved = False
+            passes += 1
+            for i in range(N):
+                u = curr_order[i]
+                v_idx = (i + 1) % N
+                v = curr_order[v_idx]
+                d_uv = D_full[u][v]
+                
+                # Cache top_indices[u] and other local variables
+                u_nbors = top_indices[u]
+                for w in u_nbors:
+                    if w == u or w == v: continue
+                    
+                    idx_w = pos_in_tour[w]
+                    idx_x = (idx_w + 1) % N
+                    x = curr_order[idx_x]
+                    if x == u or x == v: continue
+                    
+                    # Cost of current edges: (u,v) and (w,x)
+                    # Cost of potential edges: (u,w) and (v,x)
+                    if d_uv + D_full[w][x] > D_full[u][w] + D_full[v][x] + 1e-9:
+                        # Perform swap: reverse internal segment
+                        if i < idx_w:
+                            # [A, u][v, ..., w][x, C] -> reverse v...w
+                            # In slice notation: i+1 to idx_w+1
+                            start, end = i + 1, idx_w + 1
+                            curr_order[start:end] = curr_order[start:end][::-1]
+                            for k in range(start, end):
+                                pos_in_tour[curr_order[k]] = k
+                        else:
+                            # [A, x][w, ..., u][v, C] -> reverse x...u
+                            # In slice notation: idx_x to i+1
+                            start, end = idx_x, i + 1
+                            curr_order[start:end] = curr_order[start:end][::-1]
+                            for k in range(start, end):
+                                pos_in_tour[curr_order[k]] = k
+                        
+                        # Update current dist and node for next candidate check
+                        v = w
+                        d_uv = D_full[u][v]
+                        improved = True
+        
+        order = curr_order
+        # final length
+        length = 0.0
+        for idx in range(N):
+            length += D_full[curr_order[idx]][curr_order[(idx+1)%N]]
 
     return TourDecodeResult(
         order=order,
         length=length,
         feasible=feasible,
-        num_off_spanner_edges=int(num_off_spanner),
+        num_off_spanner_edges=int(num_off_spanner_patching), 
         num_edges_broken=int(num_edges_broken),
         num_components_initial=int(num_components_initial),
+        fallback_used=fallback_used,
+        num_patching_steps=int(num_patching_steps),
+        duration=time.time() - start_t
     )
 
 
-__all__ = ["decode_tour_from_edge_logits", "TourDecodeResult"]
+
+class DecodingDataset(torch.utils.data.Dataset):
+    """Dataset wrapper for parallel CPU decoding via DataLoader."""
+
+    def __init__(self, tasks: List[Tuple[Tensor, Tensor, Tensor, bool, bool, float]]) -> None:
+        """
+        Args:
+            tasks: List of (pos, spanner_edge_index, edge_logit, prefer_spanner_only, allow_off_spanner_patch, teacher_len)
+                   All tensors must be on CPU.
+        """
+        self.tasks = tasks
+
+    def __len__(self) -> int:
+        return len(self.tasks)
+
+    def __getitem__(self, idx: int) -> Tuple[TourDecodeResult, float]:
+        pos, spanner_edge_index, edge_logit, prefer_spanner, allow_patch, tlen = self.tasks[idx]
+        res = decode_tour_from_edge_logits(
+            pos=pos,
+            spanner_edge_index=spanner_edge_index,
+            edge_logit=edge_logit,
+            prefer_spanner_only=prefer_spanner,
+            allow_off_spanner_patch=allow_patch,
+        )
+        return res, tlen
+
+
+__all__ = ["decode_tour_from_edge_logits", "TourDecodeResult", "DecodingDataset"]

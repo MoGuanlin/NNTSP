@@ -32,15 +32,17 @@ from torch import Tensor
 try:
     from src.models.node_token_packer import PackedBatch, PackedNodeTokens
     from src.models.top_down_decoder import TopDownDecoder, TopDownDecoderOutput
+    from src.models.bc_state_catalog import state_logits_to_expected_iface_usage
 except Exception:  # pragma: no cover
     from .node_token_packer import PackedBatch, PackedNodeTokens
     from .top_down_decoder import TopDownDecoder, TopDownDecoderOutput
+    from .bc_state_catalog import state_logits_to_expected_iface_usage
 
 
 _NEG_INF = -1.0e9
 
 
-@dataclass(frozen=True)
+@dataclass
 class TopDownResult:
     """
     Global-packed outputs over the whole batch.
@@ -56,6 +58,7 @@ class TopDownResult:
     iface_logit: Tensor
     cross_logit: Tensor
     bc_iface_logit: Tensor
+    bc_state_logit: Optional[Tensor]
     root_ids: Tensor
     node_ptr: Tensor
     aux: Dict[str, Tensor]
@@ -86,7 +89,14 @@ class TopDownTreeRunner:
             bad = torch.nonzero(tokens.tree_parent_index[root_ids] >= 0, as_tuple=False).view(-1)[:10].tolist()
             raise ValueError(f"Some root_ids are not roots (up to 10 indices): {bad}")
 
-        return self._run(tokens=tokens, z=z, decoder=decoder, node_ptr=node_ptr, root_ids=root_ids)
+        return self._run(
+            tokens=tokens,
+            z=z,
+            decoder=decoder,
+            node_ptr=node_ptr,
+            root_ids=root_ids,
+            state_catalog=getattr(packed, "state_catalog", None),
+        )
 
     def run_single(
         self,
@@ -111,7 +121,7 @@ class TopDownTreeRunner:
         if tokens.tree_parent_index[root_ids[0]].item() >= 0:
             raise ValueError("tokens.root_id is not a root (tree_parent_index[root_id] must be < 0).")
 
-        return self._run(tokens=tokens, z=z, decoder=decoder, node_ptr=node_ptr, root_ids=root_ids)
+        return self._run(tokens=tokens, z=z, decoder=decoder, node_ptr=node_ptr, root_ids=root_ids, state_catalog=None)
 
     def _run(
         self,
@@ -121,6 +131,7 @@ class TopDownTreeRunner:
         decoder: TopDownDecoder,
         node_ptr: Tensor,               # [B+1]
         root_ids: Tensor,               # [B]
+        state_catalog: Optional[object],
     ) -> TopDownResult:
         if z.dim() != 2:
             raise ValueError("z must be 2D [total_M, d_model].")
@@ -145,12 +156,38 @@ class TopDownTreeRunner:
 
         # DP state: bc on interfaces
         bc_iface_logit = torch.full((total_M, Ti), _NEG_INF, device=device, dtype=dtype)
+        bc_state_logit: Optional[Tensor] = None
 
-        # init root bc: valid iface = 0, pad = -inf
+        use_matching = str(getattr(decoder, "state_mode", "iface")) == "matching"
+        state_used_iface: Optional[Tensor] = None
+        if use_matching:
+            if getattr(tokens, "state_mask", None) is None or state_catalog is None:
+                raise ValueError("matching mode requires packed state catalog and per-node state_mask.")
+            state_used_iface = state_catalog.used_iface.to(device=device)
+            S = int(state_used_iface.shape[0])
+            bc_state_logit = torch.full((total_M, S), _NEG_INF, device=device, dtype=dtype)
+
+        # init root bc
         root_iface_mask = tokens.iface_mask[root_ids].bool()  # [B,Ti]
-        bc_root = torch.full((root_ids.numel(), Ti), _NEG_INF, device=device, dtype=dtype)
-        bc_root = bc_root.masked_fill(root_iface_mask, 0.0)
-        bc_iface_logit = bc_iface_logit.index_copy(0, root_ids, bc_root)
+        if use_matching:
+            assert bc_state_logit is not None
+            empty_index = int(state_catalog.empty_index)
+            root_state_mask = tokens.state_mask[root_ids].bool()
+            bc_root_state = torch.full((root_ids.numel(), S), _NEG_INF, device=device, dtype=dtype)
+            bc_root_state[:, empty_index] = 0.0
+            bc_root_state = torch.where(root_state_mask, bc_root_state, torch.full_like(bc_root_state, _NEG_INF))
+            bc_state_logit = bc_state_logit.index_copy(0, root_ids, bc_root_state)
+            bc_root_iface = state_logits_to_expected_iface_usage(
+                state_logit=bc_root_state,
+                state_mask=root_state_mask,
+                state_used_iface=state_used_iface,
+            )
+            bc_root_iface = torch.where(root_iface_mask, bc_root_iface, torch.full_like(bc_root_iface, _NEG_INF))
+            bc_iface_logit = bc_iface_logit.index_copy(0, root_ids, bc_root_iface)
+        else:
+            bc_root = torch.full((root_ids.numel(), Ti), _NEG_INF, device=device, dtype=dtype)
+            bc_root = bc_root.masked_fill(root_iface_mask, 0.0)
+            bc_iface_logit = bc_iface_logit.index_copy(0, root_ids, bc_root)
 
         # reachability
         reached = torch.zeros((total_M,), device=device, dtype=torch.bool)
@@ -169,6 +206,8 @@ class TopDownTreeRunner:
             z_node = z[node_ids]                                    # [B,d]
 
             bc_in = bc_iface_logit[node_ids]                        # [B,Ti]
+            state_mask = tokens.state_mask[node_ids].bool() if use_matching else None
+            bc_in_state = bc_state_logit[node_ids] if use_matching and bc_state_logit is not None else None
 
             iface_feat6 = tokens.iface_feat6[node_ids]              # [B,Ti,6]
             iface_mask = tokens.iface_mask[node_ids].bool()         # [B,Ti]
@@ -202,6 +241,10 @@ class TopDownTreeRunner:
             child_iface_boundary_dir = tokens.iface_boundary_dir[children_clamped]
             child_iface_inside_endpoint = tokens.iface_inside_endpoint[children_clamped]
             child_iface_inside_quadrant = tokens.iface_inside_quadrant[children_clamped]
+            child_state_mask = None
+            if use_matching:
+                child_state_mask = tokens.state_mask[children_clamped].bool()
+                child_state_mask = child_state_mask & child_exists.unsqueeze(-1)
 
             out: TopDownDecoderOutput = decoder(
                 node_feat_rel=node_feat_rel,
@@ -226,6 +269,10 @@ class TopDownTreeRunner:
                 child_iface_boundary_dir=child_iface_boundary_dir,
                 child_iface_inside_endpoint=child_iface_inside_endpoint,
                 child_iface_inside_quadrant=child_iface_inside_quadrant,
+                bc_in_state_logit=bc_in_state,
+                state_mask=state_mask,
+                state_used_iface=state_used_iface,
+                child_state_mask=child_state_mask,
             )
 
             # write back local logits (differentiable)
@@ -237,8 +284,23 @@ class TopDownTreeRunner:
             flat_valid = flat_children >= 0
             if flat_valid.any().item():
                 flat_cids = flat_children[flat_valid].long()                    # [K]
-                flat_child_bc = out.child_iface_logit.view(-1, Ti)[flat_valid]  # [K,Ti]
-                bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
+                if use_matching:
+                    if out.child_state_logit is None or child_state_mask is None or bc_state_logit is None or state_used_iface is None:
+                        raise RuntimeError("matching mode decoder must return child_state_logit.")
+                    flat_child_state = out.child_state_logit.view(-1, out.child_state_logit.shape[-1])[flat_valid]
+                    flat_child_state_mask = child_state_mask.view(-1, child_state_mask.shape[-1])[flat_valid]
+                    bc_state_logit = bc_state_logit.index_copy(0, flat_cids, flat_child_state)
+                    flat_child_bc = state_logits_to_expected_iface_usage(
+                        state_logit=flat_child_state,
+                        state_mask=flat_child_state_mask,
+                        state_used_iface=state_used_iface,
+                    )
+                    child_iface_valid = tokens.iface_mask[flat_cids].bool()
+                    flat_child_bc = torch.where(child_iface_valid, flat_child_bc, torch.full_like(flat_child_bc, _NEG_INF))
+                    bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
+                else:
+                    flat_child_bc = out.child_iface_logit.view(-1, Ti)[flat_valid]  # [K,Ti]
+                    bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
                 reached[flat_cids] = True
 
         if self.validate_reachability and (not reached.all().item()):
@@ -253,6 +315,7 @@ class TopDownTreeRunner:
             iface_logit=iface_logit,
             cross_logit=cross_logit,
             bc_iface_logit=bc_iface_logit,
+            bc_state_logit=bc_state_logit,
             root_ids=root_ids,
             node_ptr=node_ptr,
             aux=aux,

@@ -4,6 +4,7 @@ Thumbs.db
 *.swp
 *.swo
 .vscode/
+.claude/
 .idea/
 
 # ===== Python =====
@@ -11,9 +12,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.python-version
 .venv/
 venv/
 env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # ===== Logs / Outputs =====
 logs/
@@ -47,6 +55,15 @@ datasets/
 *.7z
 *.rar
 *.bin
+*.so
+*.dylib
+*.dll
+*.o
+*.a
+build/
+dist/
+*.egg-info/
+*.cover
 
 # ===== Large media =====
 *.mp4
@@ -59,3 +76,16 @@ datasets/
 
 # ===== PDFs (optional) =====
 *.pdf
+!docs/paper/*.pdf
+
+# ===== Repo-local cleanup =====
+archive/
+artifacts/
+!artifacts/.gitkeep
+artifacts/samples/
+baselines_ori/
+summary/
+
+# ===== Native / baseline build artifacts =====
+src_baselines/neurolkh/SRC_swig/build/
+src_baselines/neurolkh/SRC_swig/_LKH*.so

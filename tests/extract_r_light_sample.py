@@ -87,19 +87,19 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=str,
-        default="sample_N50_r_light.pt",
+        default="artifacts/samples/sample_N50_r_light.pt",
         help="Output path for the extracted sample (single Data object)",
     )
     parser.add_argument(
         "--output_list",
         type=str,
-        default="sample_N50_r_light_list.pt",
+        default="artifacts/samples/sample_N50_r_light_list.pt",
         help="Output path for the extracted sample wrapped as a list ([Data])",
     )
     parser.add_argument(
         "--dump_info",
         type=str,
-        default="sample_N50_r_light_info.json",
+        default="artifacts/samples/sample_N50_r_light_info.json",
         help="Output path for a JSON summary (fields, shapes, dtypes)",
     )
     args = parser.parse_args()

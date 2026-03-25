@@ -73,7 +73,7 @@ class MergeEncoder(Protocol):
         ...
 
 
-@dataclass(frozen=True)
+@dataclass
 class BottomUpResult:
     z: Tensor
     computed: Tensor

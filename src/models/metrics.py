@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 
-@dataclass(frozen=True)
+@dataclass
 class EdgeLabelPack:
     """
     Edge-level labels aligned to GLOBAL EID space in a PackedBatch.

@@ -203,7 +203,7 @@ class SetTransformerEncoder(nn.Module):
 # Optional: a thin wrapper that also returns pooled latent
 # -----------------------------
 
-@dataclass(frozen=True)
+@dataclass
 class EncoderOutput:
     tokens: Tensor  # [B,T,d]
     pooled: Tensor  # [B,d]
