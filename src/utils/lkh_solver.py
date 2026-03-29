@@ -2,9 +2,69 @@
 # -*- coding: utf-8 -*-
 
 import os
+from pathlib import Path
+import shutil
 import subprocess
 from typing import List, Optional, Tuple
 import numpy as np
+
+
+def bundled_lkh_executable() -> Optional[str]:
+    """Return the repo-bundled LKH executable when present."""
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "data" / "lkh" / "LKH-3.0.13" / "LKH"
+    if candidate.is_file():
+        return str(candidate)
+    return None
+
+
+def resolve_lkh_executable(executable: Optional[str] = None) -> str:
+    """Resolve an LKH executable path with a repo-local fallback.
+
+    Resolution order:
+      1. Existing explicit filesystem path
+      2. `LKH_EXE` environment variable when set and valid
+      3. PATH lookup for the requested executable name
+      4. Repo-bundled `data/lkh/LKH-3.0.13/LKH`
+
+    If a custom non-default executable is requested and cannot be found, we
+    raise immediately instead of silently swapping in a different binary.
+    """
+    requested = str(executable or "").strip()
+    default_names = {"", "LKH", "lkh"}
+
+    lookup_name = requested or "LKH"
+    if requested:
+        requested_path = Path(requested).expanduser()
+        if requested_path.is_file():
+            return str(requested_path.resolve())
+
+    if lookup_name in default_names:
+        env_lkh = os.environ.get("LKH_EXE", "").strip()
+        if env_lkh:
+            env_path = Path(env_lkh).expanduser()
+            if env_path.is_file():
+                return str(env_path.resolve())
+
+    which_hit = shutil.which(lookup_name)
+    if which_hit:
+        return str(Path(which_hit).resolve())
+
+    bundled = bundled_lkh_executable()
+    if bundled is not None and lookup_name in default_names:
+        return bundled
+
+    if lookup_name not in default_names:
+        raise FileNotFoundError(f"LKH executable not found: {lookup_name}")
+
+    if bundled is not None:
+        return bundled
+    return lookup_name
+
+
+def default_lkh_executable() -> str:
+    """Best-effort default LKH path for CLI defaults."""
+    return resolve_lkh_executable("LKH")
 
 def write_tsp_euc2d(path: str, name: str, pos: np.ndarray):
     """Write a TSPLIB file in EUC_2D format."""
@@ -87,9 +147,9 @@ def write_tour_file(path: str, order: List[int]):
 def run_lkh(executable: str, par_path: str, timeout: Optional[float] = None):
     """Execute LKH-3 subprocess."""
     try:
-        # We use a placeholder for now, but in reality, executable would be e.g. "LKH" or "./LKH"
+        resolved_exe = resolve_lkh_executable(executable)
         result = subprocess.run(
-            [executable, par_path],
+            [resolved_exe, par_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

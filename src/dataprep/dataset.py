@@ -87,7 +87,8 @@ def consolidate_data_list(data_list: List[Any]) -> Dict[str, Any]:
     if not data_list:
         return {}
 
-    keys = ["pos", "spanner_edge_index", "spanner_edge_attr", "target_edges", "tour_len",
+    keys = ["pos", "spanner_edge_index", "spanner_edge_attr", "edge_alive_mask", "alive_edge_id", "target_edges", "tour_len", "teacher_order",
+            "teacher_num_direct", "teacher_num_projected", "teacher_num_unreachable", "teacher_num_not_alive_direct",
             "tree_node_feat", "tree_children_index", "tree_parent_index", "tree_node_depth", "is_leaf",
             "interface_assign_index", "interface_edge_attr", "interface_boundary_dir",
             "interface_inside_endpoint", "interface_inside_quadrant",
@@ -103,7 +104,19 @@ def consolidate_data_list(data_list: List[Any]) -> Dict[str, Any]:
         "keys": available_keys
     }
 
-    ptrs = {k: [0] for k in available_keys if k not in ["coord_contract_version", "tree_node_feat_box_mode", "tour_len"]}
+    ptrs = {
+        k: [0]
+        for k in available_keys
+        if k not in [
+            "coord_contract_version",
+            "tree_node_feat_box_mode",
+            "tour_len",
+            "teacher_num_direct",
+            "teacher_num_projected",
+            "teacher_num_unreachable",
+            "teacher_num_not_alive_direct",
+        ]
+    }
     
     # Pre-collect all tensors to cat
     all_data = {k: [] for k in available_keys}
@@ -134,7 +147,13 @@ def consolidate_data_list(data_list: List[Any]) -> Dict[str, Any]:
         if k in ["coord_contract_version", "tree_node_feat_box_mode"]:
             # These are usually scalar/same for all, just take first
             consolidated[k] = all_data[k][0]
-        elif k == "tour_len":
+        elif k in {
+            "tour_len",
+            "teacher_num_direct",
+            "teacher_num_projected",
+            "teacher_num_unreachable",
+            "teacher_num_not_alive_direct",
+        }:
             # [B]
             consolidated[k] = torch.stack(all_data[k])
         else:
@@ -165,7 +184,13 @@ class FastTSPDataset(Dataset):
         for k in self.available_keys:
             if k in ["coord_contract_version", "tree_node_feat_box_mode"]:
                 setattr(item, k, self.c[k])
-            elif k == "tour_len":
+            elif k in {
+                "tour_len",
+                "teacher_num_direct",
+                "teacher_num_projected",
+                "teacher_num_unreachable",
+                "teacher_num_not_alive_direct",
+            }:
                 setattr(item, k, self.c[k][idx])
             else:
                 ptr_name = f"{k}_ptr"
@@ -177,5 +202,9 @@ class FastTSPDataset(Dataset):
                 if k in transpose_keys and val.dim() == 2 and val.shape[1] == 2:
                     val = val.t()
                 setattr(item, k, val)
+
+        for meta_key in ["teacher_label_signature", "teacher_label_version", "teacher_mode"]:
+            if meta_key in self.c:
+                setattr(item, meta_key, self.c[meta_key])
         
         return item

@@ -11,27 +11,25 @@ Outputs:
   - y_child_iface/m_child_iface: per-node labels supervising the boundary
     conditions passed from each node to its 4 children.
 
-The teacher is built by computing a heuristic TSP tour on the complete Euclidean
-graph and projecting each tour edge onto the alive spanner subgraph using
-Dijkstra shortest paths.
+The current teacher is a validated Hamiltonian cycle found directly on the same
+spanner graph used by the algorithm. We refuse to store supervision unless the
+teacher is a true spanner-only cycle.
 """
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-import heapq
-from types import SimpleNamespace
 
 import torch
 from torch import Tensor
 
 try:
     from src.models.bc_state_catalog import project_iface_usage_to_state_index, project_matching_to_state_index
-    from src.models.tour_solver import solve_tsp_heuristic, tour_edges, Tour, tour_length, pairwise_dist
-    from src.utils.lkh_solver import solve_tsp_lkh
+    from src.models.teacher_solver import TEACHER_LABEL_VERSION, solve_spanner_tour_exact, solve_spanner_tour_lkh
+    from src.utils.lkh_solver import resolve_lkh_executable
 except Exception:  # pragma: no cover
     from .bc_state_catalog import project_iface_usage_to_state_index, project_matching_to_state_index
-    from .tour_solver import solve_tsp_heuristic, tour_edges, Tour, tour_length, pairwise_dist
-    from ..utils.lkh_solver import solve_tsp_lkh
+    from .teacher_solver import TEACHER_LABEL_VERSION, solve_spanner_tour_exact, solve_spanner_tour_lkh
+    from ..utils.lkh_solver import resolve_lkh_executable
 
 
 @dataclass
@@ -47,6 +45,7 @@ class TokenLabels:
       m_child_iface: [M,4,Ti] bool
       target_state_idx: [M] long (matching-state target id, or -1 if unavailable)
       m_state: [M] bool
+      m_state_exact: [M] bool (True only when target_state_idx is an exact match)
       stats: dict of diagnostics
     """
 
@@ -58,70 +57,12 @@ class TokenLabels:
     m_child_iface: Tensor
     target_state_idx: Tensor
     m_state: Tensor
+    m_state_exact: Tensor
     stats: Dict[str, Tensor]
 
 
-def _build_spanner_eid_map(edge_index: Tensor) -> Dict[Tuple[int, int], int]:
-    """Build (min(u,v), max(u,v)) -> local_eid map for spanner edges."""
-    if edge_index.dim() != 2 or edge_index.shape[0] != 2:
-        raise ValueError(f"edge_index must be [2,E], got {tuple(edge_index.shape)}")
-    E = int(edge_index.shape[1])
-    mp: Dict[Tuple[int, int], int] = {}
-    u = edge_index[0].tolist()
-    v = edge_index[1].tolist()
-    for eid in range(E):
-        a, b = int(u[eid]), int(v[eid])
-        mp[(a, b) if a < b else (b, a)] = eid
-    return mp
-
-
-def _dijkstra_path_eids(
-    N: int,
-    adj: List[List[Tuple[int, int, float]]],
-    src: int,
-    dst: int,
-) -> Optional[List[int]]:
-    """Shortest path over alive adjacency.
-
-    adj[u] = list of (v, local_eid, w)
-    Returns list of local_eid along the shortest path, or None if unreachable.
-    """
-    INF = 1e100
-    dist = [INF] * N
-    prev_v = [-1] * N
-    prev_e = [-1] * N
-    dist[src] = 0.0
-    pq: List[Tuple[float, int]] = [(0.0, src)]
-
-    while pq:
-        du, u = heapq.heappop(pq)
-        if du != dist[u]:
-            continue
-        if u == dst:
-            break
-        for v, eid, w in adj[u]:
-            nd = du + w
-            if nd < dist[v]:
-                dist[v] = nd
-                prev_v[v] = u
-                prev_e[v] = eid
-                heapq.heappush(pq, (nd, v))
-
-    if dist[dst] >= INF / 2:
-        return None
-
-    path_eids: List[int] = []
-    cur = dst
-    while cur != src:
-        eid = prev_e[cur]
-        if eid < 0:
-            return None
-        path_eids.append(int(eid))
-        cur = prev_v[cur]
-        if cur < 0:
-            return None
-    path_eids.reverse()
-    return path_eids
+class InfeasibleTeacherGraphError(RuntimeError):
+    """Raised when the alive teacher graph cannot admit a Hamiltonian cycle."""
 
 
 def _make_child_iface_targets_local(
@@ -166,12 +107,9 @@ def _make_child_iface_targets_local(
 class PseudoLabeler:
     """Pseudo labels for pretraining and top-down BC supervision.
 
-    For each graph, we obtain a teacher tour on the complete Euclidean graph and
-    then project those edges onto the alive subgraph of the spanner. A spanner
-    edge is considered "alive" if it appears in any crossing token with
-    cross_mask=True.
-
-    The resulting selected spanner edges produce:
+    For each graph, we obtain a teacher Hamiltonian cycle directly on the same
+    sparse spanner graph used by the algorithm. The resulting selected spanner
+    edges produce:
       - cross token labels: y_cross
       - iface token labels: y_iface
       - child BC labels: y_child_iface (derived from y_iface + tree children)
@@ -189,103 +127,336 @@ class PseudoLabeler:
         use_lkh: bool = False,
         lkh_exe: str = "LKH",
         prefer_cpu: bool = True,
+        teacher_mode: str = "spanner_lkh",
+        teacher_lkh_runs: int = 1,
+        teacher_lkh_timeout: Optional[float] = None,
+        teacher_exact_timeout: float = 30.0,
+        teacher_exact_max_nodes: int = 100,
     ) -> None:
         self.two_opt_passes = int(two_opt_passes)
         self.use_lkh = bool(use_lkh)
-        self.lkh_exe = str(lkh_exe)
+        self.lkh_exe = resolve_lkh_executable(str(lkh_exe))
         self.prefer_cpu = bool(prefer_cpu)
+        self.teacher_mode = str(teacher_mode)
+        self.teacher_label_version = TEACHER_LABEL_VERSION
+        self.teacher_lkh_runs = int(teacher_lkh_runs)
+        self.teacher_lkh_timeout = None if teacher_lkh_timeout is None else float(teacher_lkh_timeout)
+        self.teacher_exact_timeout = float(teacher_exact_timeout)
+        self.teacher_exact_max_nodes = int(teacher_exact_max_nodes)
+        if self.teacher_mode != "spanner_lkh":
+            raise ValueError(f"Unsupported teacher_mode: {self.teacher_mode}")
+
+    def label_signature(self) -> str:
+        return (
+            f"{TEACHER_LABEL_VERSION}"
+            f"|mode={self.teacher_mode}"
+            f"|runs={self.teacher_lkh_runs}"
+            f"|exact_timeout={self.teacher_exact_timeout:g}"
+            f"|exact_max_nodes={self.teacher_exact_max_nodes}"
+        )
+
+    def data_has_compatible_teacher(self, data: Any) -> bool:
+        if not hasattr(data, "target_edges") or getattr(data, "target_edges") is None:
+            return False
+        if not hasattr(data, "tour_len"):
+            return False
+        if not hasattr(data, "teacher_order"):
+            return False
+        sig = getattr(data, "teacher_label_signature", None)
+        return isinstance(sig, str) and sig == self.label_signature()
+
+    @staticmethod
+    def _edge_key(u: int, v: int) -> Tuple[int, int]:
+        return (u, v) if u < v else (v, u)
+
+    @staticmethod
+    def _resolve_alive_edge_ids(data: Any, total_edges: int) -> Tensor:
+        """Return original-eid indices for the alive subgraph used by tokens/DP."""
+        alive_from_mask: Optional[Tensor] = None
+        alive_from_ids: Optional[Tensor] = None
+
+        if hasattr(data, "edge_alive_mask") and getattr(data, "edge_alive_mask") is not None:
+            alive_mask = torch.as_tensor(getattr(data, "edge_alive_mask"), dtype=torch.bool).detach().cpu().view(-1)
+            if int(alive_mask.numel()) != int(total_edges):
+                raise ValueError(
+                    f"edge_alive_mask has length {int(alive_mask.numel())}, expected {int(total_edges)}"
+                )
+            alive_from_mask = torch.nonzero(alive_mask, as_tuple=False).view(-1).to(dtype=torch.long)
+
+        if hasattr(data, "alive_edge_id") and getattr(data, "alive_edge_id") is not None:
+            alive_ids = torch.as_tensor(getattr(data, "alive_edge_id"), dtype=torch.long).detach().cpu().view(-1)
+            if alive_ids.numel() > 0:
+                if int(alive_ids.min().item()) < 0 or int(alive_ids.max().item()) >= int(total_edges):
+                    raise ValueError("alive_edge_id contains out-of-range edge ids.")
+                alive_ids = torch.unique(alive_ids, sorted=True)
+            alive_from_ids = alive_ids
+
+        if alive_from_mask is not None and alive_from_ids is not None:
+            if alive_from_mask.numel() != alive_from_ids.numel() or not torch.equal(alive_from_mask, alive_from_ids):
+                raise ValueError("edge_alive_mask and alive_edge_id disagree.")
+            return alive_from_mask
+        if alive_from_mask is not None:
+            return alive_from_mask
+        if alive_from_ids is not None:
+            return alive_from_ids
+        return torch.arange(int(total_edges), dtype=torch.long)
+
+    def _extract_teacher_graph(self, data: Any) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor]:
+        """Build the exact edge set the DP/token pipeline can actually see."""
+        pos = torch.as_tensor(getattr(data, "pos"), dtype=torch.float64).detach().cpu()
+        edge_index = torch.as_tensor(getattr(data, "spanner_edge_index"), dtype=torch.long).detach().cpu()
+        if edge_index.dim() != 2 or int(edge_index.shape[0]) != 2:
+            raise ValueError(f"spanner_edge_index must be [2,E], got {tuple(edge_index.shape)}")
+        edge_attr_raw = getattr(data, "spanner_edge_attr", None)
+        edge_attr = None if edge_attr_raw is None else torch.as_tensor(edge_attr_raw, dtype=torch.float64).detach().cpu().view(-1)
+        E = int(edge_index.shape[1])
+        if edge_attr is not None and int(edge_attr.numel()) != E:
+            edge_attr = None
+
+        alive_eids = self._resolve_alive_edge_ids(data, E)
+        if alive_eids.numel() == 0:
+            raise RuntimeError("Alive subgraph has no edges; cannot build teacher supervision.")
+
+        alive_edge_index = edge_index[:, alive_eids]
+        alive_edge_attr = None if edge_attr is None else edge_attr[alive_eids]
+        return pos, alive_edge_index, alive_edge_attr, alive_eids
+
+    @staticmethod
+    def _teacher_graph_basic_failure_reason(edge_index: Tensor, num_nodes: int) -> Optional[str]:
+        """Cheap necessary-condition check before running the teacher solver."""
+        if num_nodes <= 0:
+            return "empty_graph"
+
+        edge_index = torch.as_tensor(edge_index, dtype=torch.long).detach().cpu()
+        if edge_index.dim() != 2 or int(edge_index.shape[0]) != 2:
+            return f"bad_edge_index_shape={tuple(edge_index.shape)}"
+
+        non_loop = edge_index[0] != edge_index[1]
+        edge_index = edge_index[:, non_loop]
+        deg = torch.zeros((int(num_nodes),), dtype=torch.long)
+        if edge_index.numel() > 0:
+            ones = torch.ones((int(edge_index.shape[1]),), dtype=torch.long)
+            deg.scatter_add_(0, edge_index[0], ones)
+            deg.scatter_add_(0, edge_index[1], ones)
+
+        bad_deg = torch.nonzero(deg < 2, as_tuple=False).view(-1)
+        if bad_deg.numel() > 0:
+            preview = ",".join(str(int(x)) for x in bad_deg[:10].tolist())
+            return f"degree_lt_2:{preview}"
+
+        adj: List[List[int]] = [[] for _ in range(int(num_nodes))]
+        for eid in range(int(edge_index.shape[1])):
+            a = int(edge_index[0, eid].item())
+            b = int(edge_index[1, eid].item())
+            adj[a].append(b)
+            adj[b].append(a)
+
+        seen = [False] * int(num_nodes)
+        stack = [0]
+        seen[0] = True
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if not seen[v]:
+                    seen[v] = True
+                    stack.append(v)
+
+        disconnected = [idx for idx, ok in enumerate(seen) if not ok]
+        if disconnected:
+            preview = ",".join(str(int(x)) for x in disconnected[:10])
+            return f"disconnected:{preview}"
+
+        return None
+
+    def validate_teacher_labels(self, data: Any) -> Tuple[bool, str]:
+        """Validate stored teacher labels without rerunning LKH."""
+        if not self.data_has_compatible_teacher(data):
+            return False, "missing_or_stale_teacher"
+        if not hasattr(data, "pos") or not hasattr(data, "spanner_edge_index"):
+            return False, "missing_graph_fields"
+
+        pos, edge_index, edge_attr, alive_eids = self._extract_teacher_graph(data)
+        teacher_order = torch.as_tensor(getattr(data, "teacher_order"), dtype=torch.long).detach().cpu().view(-1)
+        target_edges = torch.as_tensor(getattr(data, "target_edges"), dtype=torch.long).detach().cpu().view(-1)
+        N = int(pos.shape[0])
+        E_alive = int(edge_index.shape[1])
+
+        if teacher_order.numel() != N:
+            return False, f"teacher_order_len={teacher_order.numel()} expected={N}"
+        if target_edges.numel() != N:
+            return False, f"target_edges_len={target_edges.numel()} expected={N}"
+        if teacher_order.numel() == 0:
+            return False, "empty_teacher_order"
+        if target_edges.numel() == 0:
+            return False, "empty_target_edges"
+
+        order_list = [int(x) for x in teacher_order.tolist()]
+        if min(order_list) < 0 or max(order_list) >= N:
+            return False, "teacher_order_out_of_range"
+        if len(set(order_list)) != N:
+            return False, "teacher_order_not_permutation"
+
+        alive_set = set(int(x) for x in alive_eids.tolist())
+        for eid in target_edges.tolist():
+            if int(eid) not in alive_set:
+                return False, f"target_edge_not_alive={int(eid)}"
+
+        attr_flat = None if edge_attr is None else edge_attr.view(-1)
+        if attr_flat is not None and int(attr_flat.numel()) != E_alive:
+            attr_flat = None
+
+        eid_map: Dict[Tuple[int, int], int] = {}
+        length_map: Dict[Tuple[int, int], float] = {}
+        for sub_eid in range(E_alive):
+            a = int(edge_index[0, sub_eid])
+            b = int(edge_index[1, sub_eid])
+            key = self._edge_key(a, b)
+            if key not in eid_map:
+                eid_map[key] = sub_eid
+            if attr_flat is not None:
+                length_map[key] = float(attr_flat[sub_eid].item())
+            else:
+                dx = float(pos[a, 0].item() - pos[b, 0].item())
+                dy = float(pos[a, 1].item() - pos[b, 1].item())
+                length_map[key] = (dx * dx + dy * dy) ** 0.5
+
+        induced_eids: List[int] = []
+        induced_len = 0.0
+        for i in range(N):
+            a = order_list[i]
+            b = order_list[(i + 1) % N]
+            key = self._edge_key(a, b)
+            if key not in eid_map:
+                return False, f"off_alive_spanner_edge={a}-{b}"
+            induced_eids.append(int(alive_eids[int(eid_map[key])].item()))
+            induced_len += float(length_map[key])
+
+        stored_edges = [int(x) for x in target_edges.tolist()]
+        if len(set(induced_eids)) != N:
+            return False, "teacher_cycle_reuses_edge"
+        if stored_edges != induced_eids:
+            return False, "target_edges_mismatch_teacher_order"
+
+        stored_len = float(torch.as_tensor(getattr(data, "tour_len"), dtype=torch.float64).item())
+        tol = max(1e-4, 1e-5 * max(1.0, abs(induced_len)))
+        if abs(stored_len - induced_len) > tol:
+            return False, f"tour_len_mismatch={stored_len:.6f} expected={induced_len:.6f}"
+
+        return True, "ok"
+
+    def attach_teacher_labels(
+        self,
+        *,
+        data: Any,
+        target_edges: Any,
+        tour_len: float,
+        teacher_order: Any,
+        teacher_stats: Optional[Dict[str, int]] = None,
+    ) -> None:
+        teacher_stats = teacher_stats or {}
+        setattr(data, "target_edges", torch.as_tensor(target_edges, dtype=torch.long))
+        setattr(data, "tour_len", torch.tensor(float(tour_len), dtype=torch.float32))
+        setattr(data, "teacher_order", torch.as_tensor(teacher_order, dtype=torch.long))
+        setattr(data, "teacher_label_signature", self.label_signature())
+        setattr(data, "teacher_label_version", TEACHER_LABEL_VERSION)
+        setattr(data, "teacher_mode", self.teacher_mode)
+        setattr(data, "teacher_num_direct", int(teacher_stats.get("num_direct", 0)))
+        setattr(data, "teacher_num_projected", int(teacher_stats.get("num_projected", 0)))
+        setattr(data, "teacher_num_unreachable", int(teacher_stats.get("num_unreachable", 0)))
+        setattr(data, "teacher_num_not_alive_direct", int(teacher_stats.get("num_not_alive_direct", 0)))
 
     @staticmethod
     def simplify_data_for_ipc(data: Any) -> Dict[str, Any]:
         """Convert torch.Data tensors to numpy for safe/efficient IPC."""
-        return {
+        payload = {
             "pos": data.pos.detach().cpu().numpy(),
             "spanner_edge_index": data.spanner_edge_index.detach().cpu().numpy(),
             "spanner_edge_attr": data.spanner_edge_attr.detach().cpu().numpy(),
         }
+        if hasattr(data, "edge_alive_mask") and getattr(data, "edge_alive_mask") is not None:
+            payload["edge_alive_mask"] = getattr(data, "edge_alive_mask").detach().cpu().numpy()
+        if hasattr(data, "alive_edge_id") and getattr(data, "alive_edge_id") is not None:
+            payload["alive_edge_id"] = getattr(data, "alive_edge_id").detach().cpu().numpy()
+        return payload
+
+    def extract_teacher_supervision(
+        self,
+        data: Any,
+    ) -> Tuple[Any, float, Any, Dict[str, int]]:
+        """Compute validated teacher supervision on the sparse spanner graph."""
+        import numpy as np
+
+        if isinstance(data, dict):
+            data_obj = type("TeacherGraphPayload", (), {})()
+            for key, value in data.items():
+                setattr(data_obj, key, value)
+            data = data_obj
+
+        pos_t, edge_index_t, edge_attr_t, alive_eids_t = self._extract_teacher_graph(data)
+        basic_failure = self._teacher_graph_basic_failure_reason(edge_index_t, int(pos_t.shape[0]))
+        if basic_failure is not None:
+            raise InfeasibleTeacherGraphError(f"alive_teacher_graph_infeasible:{basic_failure}")
+        pos_np = pos_t.numpy()
+        edge_index_np = edge_index_t.numpy()
+        edge_attr_np = None if edge_attr_t is None else edge_attr_t.numpy()
+        alive_eids_np = alive_eids_t.numpy()
+
+        fallback_used = False
+        try:
+            tour = solve_spanner_tour_lkh(
+                pos=pos_np,
+                spanner_edge_index=edge_index_np,
+                spanner_edge_attr=edge_attr_np,
+                executable=self.lkh_exe,
+                runs=self.teacher_lkh_runs,
+                timeout=self.teacher_lkh_timeout,
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if (
+                pos_np.shape[0] <= self.teacher_exact_max_nodes
+                and (
+                    "LKH failed" in msg
+                    or "off-spanner" in msg
+                )
+            ):
+                try:
+                    tour = solve_spanner_tour_exact(
+                        pos=pos_np,
+                        spanner_edge_index=edge_index_np,
+                        spanner_edge_attr=edge_attr_np,
+                        time_limit=self.teacher_exact_timeout,
+                        length_weight=1.0,
+                    )
+                    fallback_used = True
+                except RuntimeError as exact_exc:
+                    raise InfeasibleTeacherGraphError(
+                        f"both_lkh_and_exact_failed:lkh={msg}|exact={exact_exc}"
+                    ) from exact_exc
+            else:
+                raise
+        mapped_edge_ids = alive_eids_np[np.asarray(tour.edge_ids, dtype=np.int64)]
+        stats = {
+            "num_direct": int(len(mapped_edge_ids)),
+            "num_projected": 0,
+            "num_unreachable": 0,
+            "num_not_alive_direct": 0,
+            "used_exact_fallback": int(fallback_used),
+        }
+        return (
+            np.asarray(mapped_edge_ids, dtype=np.int64),
+            float(tour.length),
+            np.asarray(tour.order, dtype=np.int64),
+            stats,
+        )
 
     def extract_target_edges(
         self,
         data: Any,
     ) -> Tuple[Any, float]:
-        """Compute the set of spanner edge indices that form the projected teacher tour.
-        
-        Args:
-            data: Either a PyG Data object or a dict of numpy arrays (for IPC).
-
-        Returns:
-            Tuple of (numpy.ndarray of edge indices, float of tour length).
-        """
-        import numpy as np
-
-        if isinstance(data, dict):
-            # Input from IPC (numpy simplified)
-            pos_np = data["pos"]
-            edge_index_np = data["spanner_edge_index"]
-            edge_attr_np = data["spanner_edge_attr"]
-        else:
-            # Standard Data object
-            pos_np = data.pos.detach().cpu().numpy()
-            edge_index_np = data.spanner_edge_index.detach().cpu().numpy()
-            edge_attr_np = data.spanner_edge_attr.detach().cpu().numpy()
-
-        if edge_attr_np.ndim == 2 and edge_attr_np.shape[1] == 1:
-            sp_w = edge_attr_np[:, 0].tolist()
-        else:
-            sp_w = edge_attr_np.reshape(-1).tolist()
-
-        N = int(pos_np.shape[0])
-        E = int(edge_index_np.shape[1])
-
-        # build spanner edge map (u,v)->local_eid
-        # _build_spanner_eid_map can take a tensor or we can pass a numpy version
-        # Let's just use numpy for the logic inside extract_target_edges
-        mp: Dict[Tuple[int, int], int] = {}
-        for eid in range(E):
-            a, b = int(edge_index_np[0, eid]), int(edge_index_np[1, eid])
-            mp[(a, b) if a < b else (b, a)] = eid
-        eid_map = mp
-
-        # build adjacency for Dijkstra
-        adj: List[List[Tuple[int, int, float]]] = [[] for _ in range(N)]
-        for eid in range(E):
-            a, b = int(edge_index_np[0, eid]), int(edge_index_np[1, eid])
-            w = float(sp_w[eid])
-            adj[a].append((b, eid, w))
-            adj[b].append((a, eid, w))
-
-        # teacher tour on complete graph
-        if self.use_lkh:
-            order_list = solve_tsp_lkh(pos_np, executable=self.lkh_exe)
-            if not order_list:
-                # fallback to heuristic if LKH fails
-                tour = solve_tsp_heuristic(torch.from_numpy(pos_np), start=0, max_2opt_passes=self.two_opt_passes)
-            else:
-                order_t = torch.tensor(order_list, dtype=torch.long)
-                D = pairwise_dist(torch.from_numpy(pos_np))
-                L = tour_length(order_t, D)
-                tour = Tour(order=order_t, length=L)
-        else:
-            pos_t = torch.from_numpy(pos_np)
-            tour = solve_tsp_heuristic(pos_t, start=0, max_2opt_passes=self.two_opt_passes)
-        
-        t_edges = tour_edges(tour.order)
-
-        # project teacher edges onto spanner graph
-        selected_local_eids: set[int] = set()
-        for a, b in t_edges:
-            local_eid = eid_map.get((a, b), None)
-            if local_eid is not None:
-                selected_local_eids.add(int(local_eid))
-                continue
-
-            path = _dijkstra_path_eids(N, adj, a, b)
-            if path is not None:
-                for pe in path:
-                    selected_local_eids.add(int(pe))
-
-        res = np.array(sorted(list(selected_local_eids)), dtype=np.int64)
-        return res, float(tour.length.item())
+        """Backward-compatible wrapper returning only edge ids and length."""
+        te, tlen, _, _ = self.extract_teacher_supervision(data)
+        return te, tlen
 
     def label_one(
         self,
@@ -347,68 +518,29 @@ class PseudoLabeler:
             alive_eids_local = []
         alive_set_local = set(int(x) for x in alive_eids_local)
 
-        # ---- teacher tour and projection (Skip if target_edges is already in data) ----
-        if hasattr(data, "target_edges") and data.target_edges is not None:
+        # ---- teacher tour on the same sparse spanner graph ----
+        if self.data_has_compatible_teacher(data):
             selected_local_eids = set(int(x) for x in data.target_edges.tolist())
             tour_len_val = getattr(data, "tour_len", torch.tensor(0.0)).detach().cpu()
-            num_direct = num_projected = num_unreachable = num_not_alive_direct = 0
+            num_direct = int(getattr(data, "teacher_num_direct", len(selected_local_eids)))
+            num_projected = int(getattr(data, "teacher_num_projected", 0))
+            num_unreachable = int(getattr(data, "teacher_num_unreachable", 0))
+            num_not_alive_direct = int(getattr(data, "teacher_num_not_alive_direct", 0))
         else:
-            # ---- build spanner edge map (u,v)->local_eid ----
-            eid_map = _build_spanner_eid_map(sp_edge_index)
-
-            # ---- build alive adjacency (local eids) for Dijkstra projection ----
-            adj: List[List[Tuple[int, int, float]]] = [[] for _ in range(N)]
-            u = sp_edge_index[0].tolist()
-            v = sp_edge_index[1].tolist()
-            for eid in alive_set_local:
-                if not (0 <= eid < E):
-                    continue
-                a, b = int(u[eid]), int(v[eid])
-                w = float(sp_w[eid])
-                adj[a].append((b, eid, w))
-                adj[b].append((a, eid, w))
-
-            # teacher tour on complete graph 
-            if self.use_lkh:
-                pos_np = pos.detach().cpu().numpy()
-                order_list = solve_tsp_lkh(pos_np, executable=self.lkh_exe)
-                if not order_list:
-                    tour = solve_tsp_heuristic(pos, start=0, max_2opt_passes=self.two_opt_passes)
-                else:
-                    order_t = torch.tensor(order_list, dtype=torch.long)
-                    D = pairwise_dist(pos)
-                    L = tour_length(order_t, D)
-                    tour = Tour(order=order_t, length=L)
-            else:
-                tour = solve_tsp_heuristic(pos, start=0, max_2opt_passes=self.two_opt_passes)
-            
-            t_edges = tour_edges(tour.order)  # list of (u<v)
-
-            # ---- project teacher edges onto alive spanner graph (local eids) ----
-            selected_local_eids = set()
-            num_direct = 0
-            num_projected = 0
-            num_unreachable = 0
-            num_not_alive_direct = 0
-
-            for a, b in t_edges:
-                local_eid = eid_map.get((a, b), None)
-                if local_eid is not None and local_eid in alive_set_local:
-                    selected_local_eids.add(int(local_eid))
-                    num_direct += 1
-                    continue
-                if local_eid is not None and local_eid not in alive_set_local:
-                    num_not_alive_direct += 1
-
-                path = _dijkstra_path_eids(N, adj, a, b)
-                if path is None:
-                    num_unreachable += 1
-                    continue
-                for pe in path:
-                    selected_local_eids.add(int(pe))
-                num_projected += 1
-            
-            tour_len_val = tour.length.detach().cpu()
+            te_np, tlen, order_np, teacher_stats = self.extract_teacher_supervision(data)
+            self.attach_teacher_labels(
+                data=data,
+                target_edges=te_np,
+                tour_len=tlen,
+                teacher_order=order_np,
+                teacher_stats=teacher_stats,
+            )
+            selected_local_eids = set(int(x) for x in te_np.tolist())
+            tour_len_val = torch.tensor(float(tlen), dtype=torch.float32)
+            num_direct = int(teacher_stats["num_direct"])
+            num_projected = int(teacher_stats["num_projected"])
+            num_unreachable = int(teacher_stats["num_unreachable"])
+            num_not_alive_direct = int(teacher_stats["num_not_alive_direct"])
 
         # ---- vectorized label construction in LOCAL eid space ----
         eid_table = torch.zeros((E,), dtype=torch.bool)
@@ -463,6 +595,7 @@ class PseudoLabeler:
             m_child_iface=m_child_iface.to(device),
             target_state_idx=torch.full((int(y_iface.shape[0]),), -1, dtype=torch.long, device=device),
             m_state=torch.zeros((int(y_iface.shape[0]),), dtype=torch.bool, device=device),
+            m_state_exact=torch.zeros((int(y_iface.shape[0]),), dtype=torch.bool, device=device),
             stats={k: v.to(device) for k, v in stats.items()},
         )
 
@@ -502,19 +635,23 @@ class PseudoLabeler:
         Ti = int(tokens.iface_mask.shape[1])
         Tc = int(tokens.cross_mask.shape[1])
 
-        # ---- Vectorized Bitmask Construction (REPLACES THE LOOP) ----
+        # ---- Ensure every sample has a compatible sparse-spanner teacher ----
+        for b in range(B):
+            if not self.data_has_compatible_teacher(datas[b]):
+                te, tl, order, teacher_stats = self.extract_teacher_supervision(datas[b])
+                self.attach_teacher_labels(
+                    data=datas[b],
+                    target_edges=te,
+                    tour_len=tl,
+                    teacher_order=order,
+                    teacher_stats=teacher_stats,
+                )
+
+        # ---- Vectorized Bitmask Construction ----
         # 1. Gather all global target eids
         all_global_targets = []
         for b in range(B):
-            if hasattr(datas[b], "target_edges") and datas[b].target_edges is not None:
-                # We can use the pre-computed spanner indices directly
-                targets = datas[b].target_edges.to(device)
-            else:
-                # Fallback: if somehow not pre-computed, do one one-by-one (rare/backup)
-                # But to keep things vectorized, we prioritize pre-computed.
-                # If missing, we'll just skip this graph's contribution to target bits for this batch
-                # or we could call label_one. For "Zero Redundancy", we assume pre-computed.
-                targets = torch.tensor([], dtype=torch.long, device=device)
+            targets = datas[b].target_edges.to(device)
             all_global_targets.append(targets + edge_ptr[b])
         
         targets_g = torch.cat(all_global_targets) if all_global_targets else torch.tensor([], dtype=torch.long, device=device)
@@ -542,12 +679,14 @@ class PseudoLabeler:
 
         target_state_idx = torch.full((total_M,), -1, dtype=torch.long, device=device)
         m_state = torch.zeros((total_M,), dtype=torch.bool, device=device)
+        m_state_exact = torch.zeros((total_M,), dtype=torch.bool, device=device)
         num_state_exact = 0
         num_state_fallback = 0
         if getattr(tokens, "state_mask", None) is not None and getattr(packed, "state_catalog", None) is not None:
             state_mask_all = tokens.state_mask.bool().to(device)
             state_used_iface = packed.state_catalog.used_iface.to(device)
             state_mate = packed.state_catalog.mate.to(device)
+            max_used = int(getattr(packed.state_catalog, "max_used", int(state_used_iface.sum(dim=1).max().item())))
             m_state = state_mask_all.any(dim=1)
 
             for b in range(B):
@@ -582,12 +721,18 @@ class PseudoLabeler:
                         state_mask_row=state_mask_local[local_nid],
                         state_used_iface=state_used_iface,
                         state_mate=state_mate,
+                        max_used=max_used,
                     )
                     target_state_idx[mid] = int(state_idx)
                     if exact_used:
+                        m_state_exact[mid] = True
                         num_state_exact += 1
                     else:
                         num_state_fallback += 1
+
+        num_direct_sum = sum(int(getattr(d, "teacher_num_direct", len(getattr(d, "target_edges", [])))) for d in datas)
+        num_projected_sum = sum(int(getattr(d, "teacher_num_projected", 0)) for d in datas)
+        num_unreachable_sum = sum(int(getattr(d, "teacher_num_unreachable", 0)) for d in datas)
 
         # 3. Vectorized stats aggregation (using tour_len from datas)
         t_lens = [torch.as_tensor(getattr(d, "tour_len", 0.0), device=device).view(-1) for d in datas]
@@ -597,10 +742,9 @@ class PseudoLabeler:
         stats = {
             "tour_len": tour_len_cat,
             "tour_len_mean": tour_len_cat.mean() if tour_len_cat.numel() > 0 else torch.tensor(0.0, device=device),
-            # Placeholder for projection sums (skipped in vectorized loop to eliminate redundancy)
-            "num_direct_sum": torch.tensor([0], device=device), 
-            "num_projected_sum": torch.tensor([0], device=device),
-            "num_unreachable_sum": torch.tensor([0], device=device),
+            "num_direct_sum": torch.tensor([num_direct_sum], device=device),
+            "num_projected_sum": torch.tensor([num_projected_sum], device=device),
+            "num_unreachable_sum": torch.tensor([num_unreachable_sum], device=device),
             "num_state_exact_sum": torch.tensor([num_state_exact], device=device),
             "num_state_fallback_sum": torch.tensor([num_state_fallback], device=device),
         }
@@ -622,6 +766,7 @@ class PseudoLabeler:
             m_child_iface=m_child_iface,
             target_state_idx=target_state_idx,
             m_state=m_state,
+            m_state_exact=m_state_exact,
             stats=stats,
         )
 
@@ -695,6 +840,7 @@ def _build_matching_target_for_node(
     state_mask_row: Tensor,              # [S] bool
     state_used_iface: Tensor,            # [S,Ti] bool
     state_mate: Tensor,                  # [S,Ti] long
+    max_used: int,
 ) -> tuple[int, bool]:
     del local_node_id  # reserved for future debugging / stats hooks
 
@@ -737,6 +883,9 @@ def _build_matching_target_for_node(
             state_used_iface=state_used_iface,
             state_mate=state_mate,
         ), True
+
+    if len(used_slots) > int(max_used):
+        fallback_needed = True
 
     if len(used_slots) % 2 != 0:
         fallback_needed = True

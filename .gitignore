@@ -89,3 +89,8 @@ summary/
 # ===== Native / baseline build artifacts =====
 src_baselines/neurolkh/SRC_swig/build/
 src_baselines/neurolkh/SRC_swig/_LKH*.so
+benchmarks/
+src_baselines/
+third_party/
+checkpoints/
+

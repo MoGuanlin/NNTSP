@@ -263,10 +263,12 @@ def _stable_sort_interfaces(
     iface_dir: Tensor,
     iface_inside_ep: Tensor,
     iface_inside_quad: Tensor,
+    clockwise: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """
     Deterministic ordering of interface tokens within each node:
-      sort by (nid, boundary_dir, t_along_boundary, eid)
+      default: sort by (nid, boundary_dir, t_along_boundary, eid)
+      clockwise=True: sort by true clockwise boundary order, then eid
 
     t_along_boundary:
       - Left/Right (dir 0/1): use inter_rel_y = feat6[:,3]
@@ -296,8 +298,24 @@ def _stable_sort_interfaces(
 
     # stable lexicographic sort: lowest key first
     perm = perm[torch.argsort(iface_eid[perm], stable=True)]
-    perm = perm[torch.argsort(t_q[perm], stable=True)]
-    perm = perm[torch.argsort(dir_safe[perm], stable=True)]
+    if clockwise:
+        # Clockwise traversal on the box boundary:
+        #   TOP(x↑) → RIGHT(y↓) → BOTTOM(x↓) → LEFT(y↑).
+        side_rank = torch.full_like(dir_safe, 4)
+        side_rank = torch.where(dir_safe == 3, torch.zeros_like(side_rank), side_rank)                 # TOP
+        side_rank = torch.where(dir_safe == 1, torch.ones_like(side_rank), side_rank)                  # RIGHT
+        side_rank = torch.where(dir_safe == 2, torch.full_like(side_rank, 2), side_rank)              # BOTTOM
+        side_rank = torch.where(dir_safe == 0, torch.full_like(side_rank, 3), side_rank)              # LEFT
+        t_clockwise = torch.where(
+            (dir_safe == 1) | (dir_safe == 2),
+            4096 - t_q,
+            t_q,
+        )
+        perm = perm[torch.argsort(t_clockwise[perm], stable=True)]
+        perm = perm[torch.argsort(side_rank[perm], stable=True)]
+    else:
+        perm = perm[torch.argsort(t_q[perm], stable=True)]
+        perm = perm[torch.argsort(dir_safe[perm], stable=True)]
     perm = perm[torch.argsort(iface_nid[perm], stable=True)]
 
     return (
@@ -397,6 +415,7 @@ class NodeTokenPacker:
             iface_dir=iface_dir,
             iface_inside_ep=iface_inside_ep,
             iface_inside_quad=iface_inside_quad,
+            clockwise=(self.state_mode == "matching"),
         )
 
         # caps

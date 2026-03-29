@@ -12,7 +12,16 @@ from torch import Tensor
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from src.utils.lkh_solver import write_tsp_euc2d, write_tsp_explicit, write_par, run_lkh, parse_tour, write_candidate_file, write_tour_file
+from src.utils.lkh_solver import (
+    parse_tour,
+    resolve_lkh_executable,
+    run_lkh,
+    write_candidate_file,
+    write_par,
+    write_tour_file,
+    write_tsp_euc2d,
+    write_tsp_explicit,
+)
 
 # Results reported in the paper Table 3: Comparative results on 10 largest instances of TSPLIB.
 # Time is converted to seconds: 9.9m -> 594s, 12.4m -> 744s, etc.
@@ -60,7 +69,7 @@ class LKHDecodingDataset(torch.utils.data.Dataset):
             - initial_tour: List[int] (optional, for warm start)
         """
         self.tasks = tasks
-        self.lkh_exe = lkh_executable
+        self.lkh_exe = resolve_lkh_executable(lkh_executable)
         self.num_runs = num_runs
         self.seed = seed
         self.logit_scale = logit_scale

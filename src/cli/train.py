@@ -248,17 +248,29 @@ def precompute_validation_batches(
     return batches
 
 def _label_worker_fn(args_tuple):
+    from src.models.labeler import InfeasibleTeacherGraphError
+
     idx, data_simplified, labeler = args_tuple
     # data_simplified is a dict of numpy arrays, which are safe for IPC
-    te_np, tlen = labeler.extract_target_edges(data_simplified)
-    return idx, te_np, tlen
+    try:
+        te_np, tlen, order_np, teacher_stats = labeler.extract_teacher_supervision(data_simplified)
+        return idx, True, te_np, tlen, order_np, teacher_stats, ""
+    except InfeasibleTeacherGraphError as exc:
+        return idx, False, None, None, None, None, str(exc)
+
+
+def _format_infeasible_preview(failures: List[Tuple[int, str]], limit: int = 8) -> str:
+    return ", ".join(f"{idx}:{reason}" for idx, reason in failures[:limit])
 
 def precompute_labels_for_dataset(
     data_list: List[Any],
     labeler: Any,
     num_workers: int = 0,
     desc: str = "train",
+    force: bool = False,
 ) -> List[Any]:
+    from src.models.labeler import InfeasibleTeacherGraphError
+
     if not data_list:
         return []
     
@@ -266,69 +278,203 @@ def precompute_labels_for_dataset(
     if isinstance(data_list, dict):
         return data_list
 
-    # Check if first item already has labels
-    if hasattr(data_list[0], "target_edges") and data_list[0].target_edges is not None:
+    # Check if the first item already has compatible labels
+    if (not force) and labeler.data_has_compatible_teacher(data_list[0]):
         print(f"[{desc}] Labels already present, skipping pre-computation.")
         return data_list
 
-    algo_name = "LKH" if getattr(labeler, "use_lkh", False) else "2-opt"
-    print(f"[{desc}] Pre-computing TSP labels ({algo_name} + projection) for {len(data_list)} samples...")
+    print(f"[{desc}] Pre-computing sparse-spanner LKH labels for {len(data_list)} samples...")
     t0 = time.time()
+    dropped: List[Tuple[int, str]] = []
     
     from tqdm import tqdm
     if num_workers <= 0:
         pbar = tqdm(total=len(data_list), desc=f"[{desc}] Processing")
         for i, data in enumerate(data_list):
-            te_np, tlen = labeler.extract_target_edges(data)
-            data.target_edges = torch.from_numpy(te_np)
-            data.tour_len = torch.tensor(tlen)
+            try:
+                te_np, tlen, order_np, teacher_stats = labeler.extract_teacher_supervision(data)
+                labeler.attach_teacher_labels(
+                    data=data,
+                    target_edges=te_np,
+                    tour_len=tlen,
+                    teacher_order=order_np,
+                    teacher_stats=teacher_stats,
+                )
+            except InfeasibleTeacherGraphError as exc:
+                dropped.append((i, str(exc)))
             pbar.update(1)
         pbar.close()
     else:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        # Use a list of tuples for map. Simplify data to numpy to avoid FD exhaustion.
-        tasks = [
-            (i, labeler.simplify_data_for_ipc(d), labeler) 
-            for i, d in enumerate(data_list)
-        ]
-        
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
+        # Stream tasks into the pool with bounded in-flight work. Submitting all
+        # 50k label jobs at once causes huge serialization overhead and makes the
+        # relabeling phase appear stuck before progress can advance.
+        max_inflight = max(int(num_workers) * 4, 32)
+        next_idx = 0
+
+        def submit_one(executor, sample_idx: int):
+            payload = (sample_idx, labeler.simplify_data_for_ipc(data_list[sample_idx]), labeler)
+            return executor.submit(_label_worker_fn, payload)
+
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            # We use as_completed to update progress bar in real-time
-            futures = [executor.submit(_label_worker_fn, task) for task in tasks]
-            
             pbar = tqdm(total=len(data_list), desc=f"[{desc}] Parallel Processing")
-            for future in as_completed(futures):
-                idx, te_np, tlen = future.result()
-                data_list[idx].target_edges = torch.from_numpy(te_np)
-                data_list[idx].tour_len = torch.tensor(tlen)
-                pbar.update(1)
-            pbar.close()
+            in_flight = set()
+            try:
+                while next_idx < len(data_list) and len(in_flight) < max_inflight:
+                    in_flight.add(submit_one(executor, next_idx))
+                    next_idx += 1
+
+                while in_flight:
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        idx, ok, te_np, tlen, order_np, teacher_stats, reason = future.result()
+                        if ok:
+                            labeler.attach_teacher_labels(
+                                data=data_list[idx],
+                                target_edges=te_np,
+                                tour_len=tlen,
+                                teacher_order=order_np,
+                                teacher_stats=teacher_stats,
+                            )
+                        else:
+                            dropped.append((idx, reason))
+                        pbar.update(1)
+
+                        if next_idx < len(data_list):
+                            in_flight.add(submit_one(executor, next_idx))
+                            next_idx += 1
+            finally:
+                pbar.close()
+
+    if dropped:
+        drop_set = {idx for idx, _ in dropped}
+        kept = [data for idx, data in enumerate(data_list) if idx not in drop_set]
+        print(
+            f"[{desc}] Dropping {len(dropped)} sample(s) whose alive subgraph cannot support a Hamiltonian teacher. "
+            f"First failures: {_format_infeasible_preview(dropped)}"
+        )
+        if not kept:
+            raise RuntimeError(f"[{desc}] No samples remain after dropping infeasible alive-subgraph instances.")
+        print(f"[{desc}] Keeping {len(kept)}/{len(data_list)} samples after teacher feasibility filtering.")
+        print(f"[{desc}] Done pre-computing labels in {time.time()-t0:.2f}s.")
+        return kept
 
     print(f"[{desc}] Done pre-computing labels in {time.time()-t0:.2f}s.")
     return data_list
 
 
-def dataset_has_precomputed_labels(dataset: Any) -> bool:
-    """Return True if the dataset already carries target_edges and tour_len."""
+def dataset_has_precomputed_labels(dataset: Any, *, labeler: Any | None = None) -> bool:
+    """Return True if the dataset carries compatible teacher labels."""
     if hasattr(dataset, "c") and isinstance(getattr(dataset, "c"), dict):
         consolidated = dataset.c
         keys = set(consolidated.get("keys", []))
-        return (
+        has_labels = (
             "target_edges" in keys
             and "tour_len" in keys
+            and "teacher_order" in keys
             and "target_edges" in consolidated
             and "target_edges_ptr" in consolidated
             and "tour_len" in consolidated
+            and "teacher_order" in consolidated
+            and "teacher_order_ptr" in consolidated
         )
+        if not has_labels:
+            return False
+        if labeler is None:
+            return True
+        return consolidated.get("teacher_label_signature") == labeler.label_signature()
 
     if isinstance(dataset, list) and dataset:
-        return (
+        has_labels = (
             hasattr(dataset[0], "target_edges")
             and dataset[0].target_edges is not None
             and hasattr(dataset[0], "tour_len")
+            and hasattr(dataset[0], "teacher_order")
         )
+        if not has_labels:
+            return False
+        if labeler is None:
+            return True
+        return labeler.data_has_compatible_teacher(dataset[0])
 
     return False
+
+
+def validate_dataset_teacher_labels(
+    dataset: Any,
+    *,
+    labeler: Any,
+    desc: str = "train",
+    max_failures: int = 8,
+) -> bool:
+    """Validate cached teacher labels before trusting them for training."""
+    total = len(dataset)
+    print(f"[{desc}] Validating cached teacher labels on {total} samples...")
+    failures: List[Tuple[int, str]] = []
+    pbar = tqdm(total=total, desc=f"[{desc}] Validate teacher")
+    try:
+        for idx in range(total):
+            ok, reason = labeler.validate_teacher_labels(dataset[idx])
+            if not ok:
+                failures.append((idx, reason))
+                if len(failures) >= max_failures:
+                    break
+            pbar.update(1)
+    finally:
+        pbar.close()
+
+    if failures:
+        preview = ", ".join(f"{idx}:{reason}" for idx, reason in failures[:5])
+        print(
+            f"[{desc}] Cached teacher labels failed validation on at least "
+            f"{len(failures)} sample(s); first failures: {preview}"
+        )
+        return False
+
+    print(f"[{desc}] Cached teacher labels validated successfully.")
+    return True
+
+
+def _dataset_has_alive_edge_metadata(dataset: Any) -> bool:
+    if hasattr(dataset, "c") and isinstance(getattr(dataset, "c"), dict):
+        consolidated = dataset.c
+        keys = set(consolidated.get("keys", []))
+        has_mask = (
+            "edge_alive_mask" in keys
+            and "edge_alive_mask" in consolidated
+            and "edge_alive_mask_ptr" in consolidated
+        )
+        has_ids = (
+            "alive_edge_id" in keys
+            and "alive_edge_id" in consolidated
+            and "alive_edge_id_ptr" in consolidated
+        )
+        return has_mask or has_ids
+    if isinstance(dataset, list) and dataset:
+        sample = dataset[0]
+        return (
+            hasattr(sample, "edge_alive_mask")
+            and getattr(sample, "edge_alive_mask") is not None
+        ) or (
+            hasattr(sample, "alive_edge_id")
+            and getattr(sample, "alive_edge_id") is not None
+        )
+    return False
+
+
+def _load_original_dataset_list(source_path: str) -> List[Any]:
+    src = Path(source_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Source dataset {source_path} not found.")
+    obj = torch.load(src, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict) and "num_samples" in obj:
+        raise RuntimeError(
+            f"Source dataset {source_path} is already consolidated and cannot recover per-sample alive-edge metadata."
+        )
+    if isinstance(obj, list):
+        return obj
+    return [obj]
 
 
 def ensure_dataset_labels(
@@ -340,31 +486,52 @@ def ensure_dataset_labels(
     desc: str = "train",
 ) -> Any:
     """
-    Ensure the dataset carries target_edges/tour_len.
-
-    Older .fast.pt files may have been created before labels were attached,
-    which would otherwise make training degenerate to all-zero supervision.
+    Ensure the dataset carries teacher labels compatible with the current
+    sparse-spanner LKH supervision spec.
     """
-    if dataset_has_precomputed_labels(dataset):
-        print(f"[{desc}] Dataset labels already available.")
-        return dataset
+    if hasattr(dataset, "c") and isinstance(getattr(dataset, "c"), dict) and not _dataset_has_alive_edge_metadata(dataset):
+        print(
+            f"[{desc}] Fast dataset is missing alive-edge metadata needed for consistent teacher supervision. "
+            f"Reloading original samples from {source_path}..."
+        )
+        dataset = _load_original_dataset_list(source_path)
+
+    if dataset_has_precomputed_labels(dataset, labeler=labeler):
+        if validate_dataset_teacher_labels(dataset, labeler=labeler, desc=desc):
+            print(f"[{desc}] Dataset labels already available and valid.")
+            return dataset
+        print(f"[{desc}] Cached teacher labels are invalid; regenerating...")
+
+    print(f"[{desc}] Teacher labels missing or stale. Regenerating with {labeler.label_signature()}...")
 
     if hasattr(dataset, "c") and isinstance(getattr(dataset, "c"), dict):
         from src.dataprep.dataset import FastTSPDataset
 
         total = len(dataset)
-        print(f"[{desc}] Fast dataset is missing labels. Pre-computing and caching labels for {total} samples...")
+        print(f"[{desc}] Fast dataset needs relabeling for {total} samples...")
         t0 = time.time()
 
         target_edges_list: List[Optional[torch.Tensor]] = [None] * total
         tour_len_list: List[Optional[torch.Tensor]] = [None] * total
+        teacher_order_list: List[Optional[torch.Tensor]] = [None] * total
+        teacher_stats_list: List[Optional[Dict[str, int]]] = [None] * total
+        infeasible: List[Tuple[int, str]] = []
 
         if num_workers <= 0:
             pbar = tqdm(total=total, desc=f"[{desc}] Labeling fast dataset")
             for i in range(total):
-                te_np, tlen = labeler.extract_target_edges(dataset[i])
-                target_edges_list[i] = torch.from_numpy(te_np).long()
-                tour_len_list[i] = torch.tensor(float(tlen), dtype=torch.float32)
+                try:
+                    te_np, tlen, order_np, teacher_stats = labeler.extract_teacher_supervision(dataset[i])
+                    target_edges_list[i] = torch.from_numpy(te_np).long()
+                    tour_len_list[i] = torch.tensor(float(tlen), dtype=torch.float32)
+                    teacher_order_list[i] = torch.from_numpy(order_np).long()
+                    teacher_stats_list[i] = teacher_stats
+                except Exception as exc:
+                    from src.models.labeler import InfeasibleTeacherGraphError
+                    if isinstance(exc, InfeasibleTeacherGraphError):
+                        infeasible.append((i, str(exc)))
+                    else:
+                        raise
                 pbar.update(1)
             pbar.close()
         else:
@@ -376,11 +543,30 @@ def ensure_dataset_labels(
 
             pbar = tqdm(total=total, desc=f"[{desc}] Parallel labeling fast dataset")
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                for idx, te_np, tlen in executor.map(_label_worker_fn, task_iter(), chunksize=16):
-                    target_edges_list[idx] = torch.from_numpy(te_np).long()
-                    tour_len_list[idx] = torch.tensor(float(tlen), dtype=torch.float32)
+                for idx, ok, te_np, tlen, order_np, teacher_stats, reason in executor.map(_label_worker_fn, task_iter(), chunksize=16):
+                    if ok:
+                        target_edges_list[idx] = torch.from_numpy(te_np).long()
+                        tour_len_list[idx] = torch.tensor(float(tlen), dtype=torch.float32)
+                        teacher_order_list[idx] = torch.from_numpy(order_np).long()
+                        teacher_stats_list[idx] = teacher_stats
+                    else:
+                        infeasible.append((idx, reason))
                     pbar.update(1)
             pbar.close()
+
+        if infeasible:
+            print(
+                f"[{desc}] Encountered {len(infeasible)} infeasible sample(s) while relabeling the fast dataset. "
+                f"Reloading original samples to filter them out. First failures: {_format_infeasible_preview(infeasible)}"
+            )
+            dataset = _load_original_dataset_list(source_path)
+            return ensure_dataset_labels(
+                dataset,
+                source_path=source_path,
+                labeler=labeler,
+                num_workers=num_workers,
+                desc=desc,
+            )
 
         consolidated = dict(dataset.c)
         target_ptr = [0]
@@ -397,9 +583,46 @@ def ensure_dataset_labels(
         consolidated["tour_len"] = torch.stack(
             [tl if tl is not None else torch.tensor(0.0, dtype=torch.float32) for tl in tour_len_list]
         )
+        teacher_ptr = [0]
+        teacher_chunks: List[torch.Tensor] = []
+        for order in teacher_order_list:
+            cur = order if order is not None else torch.empty((0,), dtype=torch.long)
+            teacher_chunks.append(cur)
+            teacher_ptr.append(teacher_ptr[-1] + int(cur.numel()))
+        consolidated["teacher_order"] = (
+            torch.cat(teacher_chunks, dim=0) if teacher_chunks else torch.empty((0,), dtype=torch.long)
+        )
+        consolidated["teacher_order_ptr"] = torch.tensor(teacher_ptr, dtype=torch.long)
+        consolidated["teacher_label_signature"] = labeler.label_signature()
+        consolidated["teacher_label_version"] = getattr(labeler, "teacher_label_version", "unknown")
+        consolidated["teacher_mode"] = getattr(labeler, "teacher_mode", "spanner_lkh")
+        consolidated["teacher_num_direct"] = torch.tensor(
+            [int((teacher_stats_list[i] or {}).get("num_direct", 0)) for i in range(total)],
+            dtype=torch.long,
+        )
+        consolidated["teacher_num_projected"] = torch.tensor(
+            [int((teacher_stats_list[i] or {}).get("num_projected", 0)) for i in range(total)],
+            dtype=torch.long,
+        )
+        consolidated["teacher_num_unreachable"] = torch.tensor(
+            [int((teacher_stats_list[i] or {}).get("num_unreachable", 0)) for i in range(total)],
+            dtype=torch.long,
+        )
+        consolidated["teacher_num_not_alive_direct"] = torch.tensor(
+            [int((teacher_stats_list[i] or {}).get("num_not_alive_direct", 0)) for i in range(total)],
+            dtype=torch.long,
+        )
 
         keys = list(consolidated.get("keys", []))
-        for key in ["target_edges", "tour_len"]:
+        for key in [
+            "target_edges",
+            "tour_len",
+            "teacher_order",
+            "teacher_num_direct",
+            "teacher_num_projected",
+            "teacher_num_unreachable",
+            "teacher_num_not_alive_direct",
+        ]:
             if key not in keys:
                 keys.append(key)
         consolidated["keys"] = keys
@@ -411,8 +634,27 @@ def ensure_dataset_labels(
         print(f"[{desc}] Saved labeled fast dataset to {save_path} in {time.time()-t0:.2f}s.")
         return FastTSPDataset(consolidated)
 
-    print(f"[{desc}] List dataset is missing labels. Pre-computing now...")
-    return precompute_labels_for_dataset(dataset, labeler, num_workers=num_workers, desc=desc)
+    print(f"[{desc}] List dataset needs relabeling. Pre-computing now...")
+    labeled = precompute_labels_for_dataset(
+        dataset,
+        labeler,
+        num_workers=num_workers,
+        desc=desc,
+        force=True,
+    )
+
+    from src.dataprep.dataset import FastTSPDataset, consolidate_data_list
+
+    consolidated = consolidate_data_list(labeled)
+    consolidated["teacher_label_signature"] = labeler.label_signature()
+    consolidated["teacher_label_version"] = getattr(labeler, "teacher_label_version", "unknown")
+    consolidated["teacher_mode"] = getattr(labeler, "teacher_mode", "spanner_lkh")
+    save_path = Path(source_path)
+    if ".fast.pt" not in save_path.name:
+        save_path = save_path.parent / (save_path.stem + ".fast.pt")
+    torch.save(consolidated, save_path)
+    print(f"[{desc}] Saved labeled fast dataset to {save_path}.")
+    return FastTSPDataset(consolidated)
 
 
 def compute_bc_loss(
@@ -689,7 +931,10 @@ def run_validation(
 
 
 def main() -> None:
+    from src.utils.lkh_solver import default_lkh_executable
+
     parser = argparse.ArgumentParser()
+    default_lkh = default_lkh_executable()
 
     parser.add_argument("--train_pt", type=str, required=True)
     parser.add_argument("--val_pt", type=str, default="")
@@ -718,9 +963,11 @@ def main() -> None:
     parser.add_argument("--no_shuffle", action="store_true", help="disable shuffling in training")
 
     # Teacher / labeler
-    parser.add_argument("--two_opt_passes", type=int, default=30)
-    parser.add_argument("--use_lkh", action="store_true", help="use LKH-3 for TSP ground truth instead of 2-opt")
-    parser.add_argument("--lkh_exe", type=str, default="LKH", help="path to LKH-3 executable")
+    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
+    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
+    parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH-3 executable")
+    parser.add_argument("--teacher_lkh_runs", type=int, default=1, help="number of LKH runs for sparse-spanner teacher generation")
+    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="timeout in seconds for one sparse-spanner teacher solve (0 = disabled)")
 
     # Top-down decoder
     parser.add_argument("--td_mode", type=str, default="two_stage", choices=["two_stage", "one_stage"])
@@ -800,8 +1047,12 @@ def main() -> None:
         two_opt_passes=int(args.two_opt_passes),
         use_lkh=bool(args.use_lkh),
         lkh_exe=str(args.lkh_exe),
-        prefer_cpu=True
+        prefer_cpu=True,
+        teacher_mode="spanner_lkh",
+        teacher_lkh_runs=int(args.teacher_lkh_runs),
+        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
+    print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
 
     # 1. Load Datasets
     print(f"[data] Loading training dataset...")

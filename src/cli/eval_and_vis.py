@@ -204,7 +204,10 @@ class TeacherDataset(torch.utils.data.Dataset):
 
 
 def main(argv: List[str] | None = None):
+    from src.utils.lkh_solver import default_lkh_executable
+
     parser = argparse.ArgumentParser()
+    default_lkh = default_lkh_executable()
     parser.add_argument("--ckpt", type=str, required=False, help="path to model checkpoint")
     parser.add_argument("--data_pt", type=str, required=False, help="path to data .pt (list of Data)")
     parser.add_argument("--sample_idx", type=int, default=0, help="start sample index")
@@ -213,10 +216,12 @@ def main(argv: List[str] | None = None):
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--output_dir", type=str, default="outputs/eval")
     parser.add_argument("--use_iface_in_decode", type=parse_bool_arg, default=True)
-    parser.add_argument("--lkh_exe", type=str, default="LKH", help="path to LKH executable")
-    parser.add_argument("--use_lkh", action="store_true", help="use LKH for ground truth projection")
+    parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
+    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
     parser.add_argument("--no_vis", action="store_true", help="disable visualization")
-    parser.add_argument("--two_opt_passes", type=int, default=30, help="passes for teacher tour")
+    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
+    parser.add_argument("--teacher_lkh_runs", type=int, default=1)
+    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers for parallel decoding")
@@ -336,7 +341,11 @@ def main(argv: List[str] | None = None):
         use_lkh=bool(args.use_lkh),
         lkh_exe=str(args.lkh_exe),
         prefer_cpu=True,
+        teacher_mode="spanner_lkh",
+        teacher_lkh_runs=int(args.teacher_lkh_runs),
+        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
+    print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

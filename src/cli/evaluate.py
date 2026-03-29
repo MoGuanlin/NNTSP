@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List
 
 from src.cli import eval_and_vis as synthetic_eval
+from src.cli import eval_onepass as onepass_eval
 from src.cli import evaluate_tsplib as tsplib_eval
 
 
@@ -16,14 +17,17 @@ def resolve_synthetic_data_path(*, synthetic_n: int, synthetic_data_root: str) -
 
 
 def main(argv: List[str] | None = None) -> None:
+    from src.utils.lkh_solver import default_lkh_executable
+
     parser = argparse.ArgumentParser(
         description="Unified evaluation entry for synthetic standard datasets and TSPLIB."
     )
-    parser.add_argument("--benchmark", type=str, default="synthetic", choices=("synthetic", "tsplib"))
+    default_lkh = default_lkh_executable()
+    parser.add_argument("--benchmark", type=str, default="synthetic", choices=("synthetic", "tsplib", "onepass"))
     parser.add_argument("--ckpt", type=str, required=False, help="path to model checkpoint")
     parser.add_argument("--r", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--lkh_exe", type=str, default="LKH", help="path to LKH executable")
+    parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers for decoding / baselines")
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
@@ -43,6 +47,17 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--use_lkh", action="store_true", help="use LKH for synthetic teacher projection")
     parser.add_argument("--no_vis", action="store_true", help="disable synthetic visualization")
     parser.add_argument("--two_opt_passes", type=int, default=30, help="teacher tour passes for synthetic evaluation")
+    parser.add_argument("--dp_topk", type=int, default=5, help="onepass: PARSE_TOPK K")
+    parser.add_argument("--dp_max_sigma", type=int, default=0, help="onepass: max parent-state candidates per node; 0 disables truncation")
+    parser.add_argument("--dp_child_catalog_cap", type=int, default=0, help="onepass/catalog_enum: max child states kept after C1+ranking; 0 disables truncation")
+    parser.add_argument(
+        "--dp_fallback_exact",
+        type=onepass_eval.parse_bool_arg,
+        default=True,
+        help="onepass: enable exact fallback for heuristic parse and uncapped retry after catalog_enum child-cap failure",
+    )
+    parser.add_argument("--dp_leaf_workers", type=int, default=16, help="onepass: number of workers for leaf exact solve")
+    parser.add_argument("--dp_parse_mode", type=str, default="catalog_enum", choices=("catalog_enum", "heuristic"), help="onepass: PARSE mode")
 
     parser.add_argument("--tsplib_dir", type=str, default="benchmarks/tsplib", help="directory with TSPLIB .tsp files")
     parser.add_argument("--tsplib_set", type=str, default=None, help="TSPLIB preset, for example largest10, paper, all, or largest:25")
@@ -105,6 +120,50 @@ def main(argv: List[str] | None = None) -> None:
         if args.use_iface_in_decode is not None:
             child_argv += ["--use_iface_in_decode", str(args.use_iface_in_decode)]
         synthetic_eval.main(child_argv)
+        return
+
+    if args.benchmark == "onepass":
+        data_pt = args.data_pt
+        if not data_pt:
+            if args.synthetic_n is None:
+                parser.error(
+                    "--synthetic_n or --data_pt required "
+                    "for --benchmark onepass"
+                )
+            data_pt = resolve_synthetic_data_path(
+                synthetic_n=int(args.synthetic_n),
+                synthetic_data_root=str(args.synthetic_data_root),
+            )
+        child_argv = [
+            "--ckpt", str(args.ckpt),
+            "--data_pt", str(data_pt),
+            "--sample_idx", str(args.sample_idx),
+            "--r", str(args.r),
+            "--device", str(args.device),
+            "--lkh_exe", str(args.lkh_exe),
+            "--two_opt_passes", str(args.two_opt_passes),
+            "--num_workers", str(args.num_workers),
+            "--exact_time_limit", str(args.exact_time_limit),
+            "--exact_length_weight",
+            str(args.exact_length_weight),
+            "--output_dir",
+            str(args.output_dir or "outputs/eval_onepass"),
+            "--dp_topk", str(args.dp_topk),
+            "--dp_max_sigma", str(args.dp_max_sigma),
+            "--dp_child_catalog_cap", str(args.dp_child_catalog_cap),
+            "--dp_fallback_exact", str(args.dp_fallback_exact),
+            "--dp_leaf_workers", str(args.dp_leaf_workers),
+            "--dp_parse_mode", str(args.dp_parse_mode),
+        ]
+        if args.sample_idx_end is not None:
+            child_argv += [
+                "--sample_idx_end", str(args.sample_idx_end),
+            ]
+        if args.settings:
+            child_argv += ["--settings", str(args.settings)]
+        if args.use_lkh:
+            child_argv.append("--use_lkh")
+        onepass_eval.main(child_argv)
         return
 
     child_argv = [

@@ -11,6 +11,19 @@ each quadtree node, uses a **sigma-conditioned decoder** to predict child state
 4-tuples, and employs **PARSE + VERIFYTUPLE + exact fallback** to guarantee feasible
 cost table entries.
 
+## 1.1 Coexistence with existing 2-pass pipeline
+
+**CRITICAL**: The 1-pass DP is an **optional mode** controlled by runtime switches.
+All existing 2-pass code (BottomUpTreeRunner, TopDownTreeRunner, TopDownDecoder,
+edge_aggregation, losses, train.py, etc.) remains **untouched and fully functional**.
+
+The switch mechanism:
+- **Training**: `--dp_mode=twopass` (default, existing) vs `--dp_mode=onepass`
+- **Inference**: `decode_backend='greedy'|'exact'|'guided_lkh'` (existing)
+  vs `decode_backend='dp_onepass'` (new)
+- All new modules live in separate files (`dp_core.py`, `merge_decoder.py`,
+  `dp_runner.py`) and are never imported unless the onepass mode is active.
+
 ## 2. Adjusted Plan (vs. original paper)
 
 | Aspect | Paper (Section 3) | Our Plan |

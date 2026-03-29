@@ -421,7 +421,10 @@ def load_neurolkh(device: torch.device, ckpt_path: str):
 
 
 def main(argv: List[str] | None = None):
+    from src.utils.lkh_solver import default_lkh_executable
+
     parser = argparse.ArgumentParser()
+    default_lkh = default_lkh_executable()
     parser.add_argument("--ckpt", type=str, required=False, help="path to model checkpoint")
     parser.add_argument("--tsplib_dir", type=str, default="benchmarks/tsplib", help="directory with .tsp files")
     parser.add_argument("--num_instances", type=int, default=10, help="number of largest instances to test")
@@ -440,7 +443,7 @@ def main(argv: List[str] | None = None):
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--r", type=int, default=4)
-    parser.add_argument("--lkh_exe", type=str, default="LKH", help="path to LKH executable")
+    parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
     parser.add_argument("--skip_guided_lkh", action="store_true", help="legacy flag: remove guided_lkh from selected settings")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
