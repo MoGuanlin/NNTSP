@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import random
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,12 +14,15 @@ from typing import Any, Dict, List
 import matplotlib.pyplot as plt
 import torch
 
+from src.cli.common import load_dataset, log_progress, move_data_tensors_to_device, parse_bool_arg, resolve_device
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
+from src.cli.model_factory import load_twopass_eval_models
 
 
 AVAILABLE_SETTINGS = (
     "greedy",
     "exact",
+    "spanner_uniform_lkh",
     "guided_lkh",
     "pure_lkh",
     "pomo",
@@ -37,14 +39,19 @@ DEFAULT_SETTINGS = (
 
 SETTING_GROUPS = {
     "default": DEFAULT_SETTINGS,
-    "all": ("greedy", "exact", "guided_lkh", "pure_lkh", "pomo", "neurolkh"),
+    "all": ("greedy", "exact", "spanner_uniform_lkh", "guided_lkh", "pure_lkh", "pomo", "neurolkh"),
     "ours": ("greedy", "exact", "guided_lkh"),
     "baselines": ("pomo", "neurolkh"),
     "reference": ("pure_lkh",),
-    "lkh": ("guided_lkh", "pure_lkh"),
+    "lkh": ("spanner_uniform_lkh", "guided_lkh", "pure_lkh"),
+    "practical_lkh": ("spanner_uniform_lkh", "guided_lkh", "pure_lkh"),
 }
 
 SETTING_ALIASES = {
+    "spanner": "spanner_uniform_lkh",
+    "spanner_only": "spanner_uniform_lkh",
+    "spanner_lkh": "spanner_uniform_lkh",
+    "uniform_lkh": "spanner_uniform_lkh",
     "guided": "guided_lkh",
     "guidedlkh": "guided_lkh",
     "pure": "pure_lkh",
@@ -55,6 +62,7 @@ SETTING_ALIASES = {
 SETTING_DISPLAY_NAMES = {
     "greedy": "Greedy",
     "exact": "Exact Sparse",
+    "spanner_uniform_lkh": "Spanner-only LKH",
     "guided_lkh": "Guided LKH",
     "pure_lkh": "Pure LKH",
     "pomo": "POMO",
@@ -64,55 +72,12 @@ SETTING_DISPLAY_NAMES = {
 SETTING_COLORS = {
     "greedy": "red",
     "exact": "darkorange",
+    "spanner_uniform_lkh": "teal",
     "guided_lkh": "blue",
     "pure_lkh": "green",
     "pomo": "purple",
     "neurolkh": "brown",
 }
-
-
-def parse_bool_arg(value):
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if str(device_arg).startswith("cuda") and torch.cuda.is_available():
-        return torch.device(device_arg)
-    return torch.device("cpu")
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def move_data_tensors_to_device(data: Any, device: torch.device) -> Any:
-    skip = {"num_faces"}
-    for k in dir(data):
-        if k.startswith("_") or k in skip:
-            continue
-        v = getattr(data, k, None)
-        if isinstance(v, torch.Tensor):
-            try:
-                setattr(data, k, v.to(device))
-            except Exception:
-                pass
-    return data
-
-
-def load_dataset(path: str):
-    from src.dataprep.dataset import smart_load_dataset
-
-    return smart_load_dataset(path)
-
 
 def plot_tour(pos, edge_index, ax, color="blue", lw=1.5, alpha=1.0, label=None, linestyle="-"):
     pos_np = pos.detach().cpu().numpy()
@@ -138,11 +103,6 @@ def prepare_edges(order, device: torch.device) -> torch.Tensor:
 
 def placeholder_result() -> SimpleNamespace:
     return SimpleNamespace(feasible=False, length=float("inf"), duration=0.0, order=[])
-
-
-def log_progress(prefix: str, message: str) -> None:
-    print(f"{prefix} {message}", flush=True)
-
 
 def load_pomo(device: torch.device, ckpt_path: str):
     from src_baselines.pomo.POMO.TSPEnv import TSPEnv
@@ -259,16 +219,12 @@ def main(argv: List[str] | None = None):
     device = resolve_device(str(args.device))
     print(f"[env] device={device}")
 
-    from src.models.bc_state_catalog import infer_boundary_state_count
     from src.models.bottom_up_runner import BottomUpTreeRunner
     from src.models.decode_backend import DecodingDataset
     from src.models.edge_aggregation import aggregate_logits_to_edges
     from src.models.labeler import PseudoLabeler
-    from src.models.leaf_encoder import LeafEncoder
     from src.models.lkh_decode import solve_with_lkh_parallel
-    from src.models.merge_encoder import MergeEncoder
     from src.models.node_token_packer import NodeTokenPacker
-    from src.models.top_down_decoder import TopDownDecoder
     from src.models.top_down_runner import TopDownTreeRunner
 
     dataset = load_dataset(args.data_pt)
@@ -278,34 +234,18 @@ def main(argv: List[str] | None = None):
     num_samples = end_idx - start_idx
 
     print(f"[ckpt] loading from {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    if "leaf_encoder" in ckpt and "emb_type.weight" in ckpt["leaf_encoder"]:
-        d_model = ckpt["leaf_encoder"]["emb_type.weight"].shape[1]
-    else:
-        d_model = 128
+    model_bundle = load_twopass_eval_models(
+        ckpt_path=args.ckpt,
+        device=device,
+        r=int(args.r),
+    )
+    d_model = model_bundle.d_model
+    state_mode = model_bundle.state_mode
+    matching_max_used = model_bundle.matching_max_used
+    leaf_encoder = model_bundle.leaf_encoder
+    merge_encoder = model_bundle.merge_encoder
+    decoder = model_bundle.decoder
     print(f"[model] detected d_model={d_model}")
-
-    ckpt_args = ckpt.get("args", {})
-    state_mode = str(ckpt_args.get("state_mode", "iface"))
-    matching_max_used = int(ckpt_args.get("matching_max_used", 4))
-    num_states = None
-    if state_mode == "matching":
-        num_states = infer_boundary_state_count(num_slots=4 * int(args.r), max_used=matching_max_used)
-
-    leaf_encoder = LeafEncoder(d_model=d_model).to(device)
-    merge_encoder = MergeEncoder(d_model=d_model).to(device)
-    decoder = TopDownDecoder(
-        d_model=d_model,
-        mode=ckpt_args.get("td_mode", "two_stage"),
-        state_mode=state_mode,
-        num_states=num_states,
-    ).to(device)
-    leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
-    merge_encoder.load_state_dict(ckpt["merge_encoder"])
-    decoder.load_state_dict(ckpt["decoder"])
-    leaf_encoder.eval()
-    merge_encoder.eval()
-    decoder.eval()
     print("[ckpt] loaded.\n")
 
     pomo_model = None
@@ -484,6 +424,17 @@ def main(argv: List[str] | None = None):
 
         lkh_tasks = []
         lkh_task_names: List[str] = []
+
+        if "spanner_uniform_lkh" in selected_settings:
+            lkh_tasks.append(
+                {
+                    "pos": data_pos,
+                    "mode": "spanner_uniform",
+                    "edge_index": sp_edge_index,
+                    "teacher_len": teacher_len,
+                }
+            )
+            lkh_task_names.append("spanner_uniform_lkh")
 
         if "guided_lkh" in selected_settings:
             greedy_res = greedy_results[i]

@@ -22,6 +22,8 @@ def decode_tour(
     allow_off_spanner_patch: bool = True,
     exact_time_limit: float = 30.0,
     exact_length_weight: float = 0.0,
+    greedy_refine_max_n: int | None = None,
+    greedy_fallback_max_n: int | None = None,
 ) -> TourDecodeResult:
     backend = str(backend).lower()
     if backend == "greedy":
@@ -31,6 +33,8 @@ def decode_tour(
             edge_logit=edge_logit,
             prefer_spanner_only=prefer_spanner_only,
             allow_off_spanner_patch=allow_off_spanner_patch,
+            refine_max_n=greedy_refine_max_n,
+            fallback_max_n=greedy_fallback_max_n,
         )
     if backend == "exact":
         return decode_tour_exact_from_edge_logits(

@@ -24,6 +24,13 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from src.cli.common import (
+    load_dataset,
+    log_progress,
+    move_data_tensors_to_device,
+    parse_bool_arg,
+    resolve_device,
+)
 from src.cli.eval_and_vis import (
     AVAILABLE_SETTINGS,
     DEFAULT_SETTINGS,
@@ -31,14 +38,10 @@ from src.cli.eval_and_vis import (
     SETTING_COLORS,
     SETTING_DISPLAY_NAMES,
     SETTING_GROUPS,
-    load_dataset,
-    log_progress,
-    move_data_tensors_to_device,
-    parse_bool_arg,
     placeholder_result,
-    resolve_device,
 )
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
+from src.cli.model_factory import load_onepass_eval_models
 
 
 def _sort_depth_items(depth_stats: Any) -> List[tuple[str, Dict[str, float]]]:
@@ -79,6 +82,20 @@ def _format_depth_fallback_summary(dp_stats: Dict[str, Any]) -> str:
         rate = float(bucket.get("fallback_rate", 0.0))
         parts.append(f"d{depth_key}={fallback}/{total} ({rate * 100.0:.1f}%)")
     return ", ".join(parts) if parts else "none"
+
+
+def _result_record_entry(res: Any, teacher_len: float) -> Dict[str, Any]:
+    """Serialize a decode result, keeping length even when teacher is unavailable."""
+    feasible = bool(getattr(res, "feasible", False))
+    length = float(getattr(res, "length", float("inf")))
+    has_length = feasible and math.isfinite(length)
+    has_teacher = math.isfinite(float(teacher_len)) and float(teacher_len) > 1e-9
+    gap = (length / float(teacher_len) - 1.0) if has_length and has_teacher else None
+    return {
+        "length": length if has_length else None,
+        "gap": gap,
+        "feasible": feasible,
+    }
 
 
 def main(argv: List[str] | None = None):
@@ -128,13 +145,18 @@ def main(argv: List[str] | None = None):
     parser.add_argument("--teacher_lkh_runs", type=int, default=1)
     parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
 
-    # Decode settings
+    # Optional downstream decode settings
     parser.add_argument("--settings", type=str, default=None,
-                        help="comma-separated decode settings (greedy, exact, guided_lkh, ...)")
+                        help="comma-separated optional downstream decode settings (greedy, exact, guided_lkh, pure_lkh, ...)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--exact_time_limit", type=float, default=30.0)
     parser.add_argument("--exact_length_weight", type=float, default=0.0)
     parser.add_argument("--list_settings", action="store_true")
+    parser.add_argument(
+        "--vis_direct_failure",
+        action="store_true",
+        help="save a diagnostic plot when direct DP traceback fails",
+    )
 
     args = parser.parse_args(argv)
 
@@ -145,14 +167,17 @@ def main(argv: List[str] | None = None):
     selected_settings = resolve_eval_settings(
         requested=args.settings,
         available=AVAILABLE_SETTINGS,
-        default=("greedy",),
+        default=(),
         aliases=SETTING_ALIASES,
         groups=SETTING_GROUPS,
         enable_exact=False,
     )
-    # For 1-pass eval, we add "dp_onepass" as the primary method
-    # and allow downstream re-decoding via greedy/exact/LKH
-    print(f"[eval] decode settings: {', '.join(selected_settings)}")
+    # For 1-pass eval, direct traceback is the primary output.
+    # Greedy / exact / guided LKH remain available as explicit opt-in re-decoders.
+    if selected_settings:
+        print(f"[eval] optional decode settings: {', '.join(selected_settings)}")
+    else:
+        print("[eval] optional decode settings: none (direct traceback only)")
 
     device = resolve_device(str(args.device))
     print(f"[env] device={device}")
@@ -162,43 +187,30 @@ def main(argv: List[str] | None = None):
     from src.models.decode_backend import DecodingDataset
     from src.models.dp_runner import OnePassDPRunner
     from src.models.labeler import PseudoLabeler
-    from src.models.leaf_encoder import LeafEncoder
-    from src.models.merge_decoder import MergeDecoder
-    from src.models.merge_encoder import MergeEncoder
+    from src.models.lkh_decode import solve_with_lkh_parallel
     from src.models.node_token_packer import NodeTokenPacker
     from src.models.tour_reconstruct import dp_result_to_edge_scores
+    from src.visualization.visualize_direct_reconstruction_failure import (
+        save_direct_reconstruction_failure_plot,
+    )
 
     # ─── Load checkpoint ─────────────────────────────────────────────
     print(f"[ckpt] loading from {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    ckpt_args = ckpt.get("args", {})
-
-    d_model = int(ckpt_args.get("d_model", 128))
     r = int(args.r)
-    Ti = 4 * r
-    matching_max_used = int(ckpt_args.get("matching_max_used", args.dp_max_used))
-
-    leaf_encoder = LeafEncoder(d_model=d_model).to(device)
-    merge_encoder = MergeEncoder(d_model=d_model).to(device)
-    merge_decoder = MergeDecoder(
-        d_model=d_model,
-        n_heads=max(4, d_model // 32),
-        num_iface_slots=Ti,
-        parent_num_layers=int(ckpt_args.get("parent_num_layers", 3)),
-        cross_num_layers=int(ckpt_args.get("cross_num_layers", 2)),
-        max_depth=64,
-    ).to(device)
-
-    leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
-    merge_encoder.load_state_dict(ckpt["merge_encoder"])
-    if "merge_decoder" in ckpt:
-        merge_decoder.load_state_dict(ckpt["merge_decoder"])
-    else:
+    model_bundle = load_onepass_eval_models(
+        ckpt_path=args.ckpt,
+        device=device,
+        r=r,
+        default_matching_max_used=int(args.dp_max_used),
+    )
+    d_model = model_bundle.d_model
+    Ti = model_bundle.num_iface_slots
+    matching_max_used = model_bundle.matching_max_used
+    leaf_encoder = model_bundle.leaf_encoder
+    merge_encoder = model_bundle.merge_encoder
+    merge_decoder = model_bundle.merge_decoder
+    if not model_bundle.merge_decoder_loaded:
         print("[warn] No merge_decoder in checkpoint, using random weights")
-
-    leaf_encoder.eval()
-    merge_encoder.eval()
-    merge_decoder.eval()
     print(f"[ckpt] loaded (d={d_model}, r={r}, Ti={Ti})")
 
     # ─── Dataset ──────────────────────────────────────────────────────
@@ -271,6 +283,20 @@ def main(argv: List[str] | None = None):
     for offset, s_idx in enumerate(range(start_idx, end_idx), start=1):
         prefix = f"[eval {offset}/{num_samples}] sample={s_idx}"
         data = dataset[s_idx]
+
+        # ── Pure complete-graph LKH (log FIRST so long DP runs still leave a reference) ──
+        log_progress(prefix, "computing pure complete-graph LKH...")
+        pure_lkh_result = solve_with_lkh_parallel(
+            [{"pos": data.pos.detach().cpu(), "mode": "pure", "teacher_len": float("nan")}],
+            lkh_executable=args.lkh_exe,
+            num_workers=1,
+        )[0][0]
+        _log_result({
+            "sample_idx": s_idx,
+            "stage": "prefetch_pure_lkh",
+            "pure_lkh": _result_record_entry(pure_lkh_result, float("nan")),
+        })
+
         data = move_data_tensors_to_device(data, device)
 
         # ── Teacher tour (compute FIRST, before expensive DP) ────────
@@ -349,7 +375,24 @@ def main(argv: List[str] | None = None):
             "dp_stats": dp_result.stats,
             "depth_fallback_rates": _extract_depth_fallback_rates(dp_result.stats),
             "teacher_len": teacher_len,
+            "pure_lkh_result": pure_lkh_result,
         }
+
+        if bool(args.vis_direct_failure) and not dp_result.tour_feasible:
+            vis_path = output_dir / "direct_failure" / f"sample_{s_idx}.png"
+            try:
+                saved = save_direct_reconstruction_failure_plot(
+                    data=data,
+                    direct_tour_stats=dp_result.tour_stats,
+                    sample_idx=s_idx,
+                    output_path=vis_path,
+                )
+            except Exception as exc:
+                dp_result.tour_stats["diagnostic_png_error"] = str(exc)
+            else:
+                if saved is not None:
+                    dp_result.tour_stats["diagnostic_png"] = str(saved)
+                    mo["direct_tour_stats"] = dp_result.tour_stats
         model_outputs.append(mo)
 
         # Write result to disk immediately
@@ -362,6 +405,7 @@ def main(argv: List[str] | None = None):
         depth_fallback_rates = _extract_depth_fallback_rates(dp_result.stats)
         _log_result({
             "sample_idx": s_idx,
+            "stage": "phase1_dp",
             "teacher_len": teacher_len,
             "dp_cost": dp_result.tour_cost,
             "dp_gap": dp_gap,
@@ -445,8 +489,10 @@ def main(argv: List[str] | None = None):
         if s not in selected_settings:
             continue
         print(f"[eval] Phase 4: Running {SETTING_DISPLAY_NAMES.get(s, s)}...")
-        from src.models.lkh_decode import solve_with_lkh_parallel
         for i, mo in enumerate(model_outputs):
+            if s == "pure_lkh":
+                lkh_results[s][i] = mo["pure_lkh_result"]
+                continue
             if s == "guided_lkh":
                 gr = greedy_results[i]
                 initial_tour = mo["direct_tour_order"] if mo["direct_tour_feasible"] else (
@@ -460,8 +506,6 @@ def main(argv: List[str] | None = None):
                     "teacher_len": mo["teacher_len"],
                     "initial_tour": initial_tour,
                 }]
-            else:
-                tasks = [{"pos": mo["pos"], "mode": "pure", "teacher_len": mo["teacher_len"]}]
             results = solve_with_lkh_parallel(tasks, lkh_executable=args.lkh_exe, num_workers=1)
             lkh_results[s][i] = results[0][0]
 
@@ -473,6 +517,7 @@ def main(argv: List[str] | None = None):
         direct_len = mo["direct_tour_length"]
         record = {
             "sample_idx": mo["s_idx"],
+            "stage": "final_decode",
             "teacher_len": teacher_len,
             "dp_cost": dp_cost,
             "dp_gap": (dp_cost / teacher_len - 1.0) if dp_cost < float("inf") and teacher_len > 1e-9 else None,
@@ -508,17 +553,16 @@ def main(argv: List[str] | None = None):
             else:
                 continue
 
-            if res.feasible and res.length < float("inf") and teacher_len > 1e-9:
-                gap = res.length / teacher_len - 1.0
-                stats[setting]["len"] += res.length
-                stats[setting]["gap"] += gap
+            entry = _result_record_entry(res, teacher_len)
+            if entry["length"] is not None and entry["gap"] is not None:
+                stats[setting]["len"] += float(entry["length"])
+                stats[setting]["gap"] += float(entry["gap"])
                 stats[setting]["time"] += getattr(res, "duration", 0.0)
                 stats[setting]["cnt"] += 1
-                record[setting] = {"length": res.length, "gap": gap, "feasible": True}
-            else:
-                record[setting] = {"length": None, "gap": None, "feasible": getattr(res, "feasible", False)}
+            record[setting] = entry
 
-        _log_result(record)
+        if selected_settings:
+            _log_result(record)
 
     # Print summary table
     print("\n" + "=" * 70)

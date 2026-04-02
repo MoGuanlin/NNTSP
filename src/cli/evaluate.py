@@ -8,12 +8,18 @@ from pathlib import Path
 from typing import List
 
 from src.cli import eval_and_vis as synthetic_eval
+from src.cli import eval_training_cost as training_cost_eval
+from src.cli import eval_twopass_timing as twopass_timing_eval
 from src.cli import eval_onepass as onepass_eval
 from src.cli import evaluate_tsplib as tsplib_eval
 
 
 def resolve_synthetic_data_path(*, synthetic_n: int, synthetic_data_root: str) -> str:
     return str(Path(synthetic_data_root) / f"N{int(synthetic_n)}" / "test_r_light_pyramid.pt")
+
+
+def resolve_synthetic_raw_data_path(*, synthetic_n: int, synthetic_data_root: str) -> str:
+    return str(Path(synthetic_data_root) / f"N{int(synthetic_n)}" / "test.pt")
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -23,12 +29,20 @@ def main(argv: List[str] | None = None) -> None:
         description="Unified evaluation entry for synthetic standard datasets and TSPLIB."
     )
     default_lkh = default_lkh_executable()
-    parser.add_argument("--benchmark", type=str, default="synthetic", choices=("synthetic", "tsplib", "onepass"))
+    parser.add_argument(
+        "--benchmark",
+        type=str,
+        default="synthetic",
+        choices=("synthetic", "tsplib", "onepass", "twopass_timing", "training_cost"),
+    )
     parser.add_argument("--ckpt", type=str, required=False, help="path to model checkpoint")
     parser.add_argument("--r", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers for decoding / baselines")
+    parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
+    parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
+    parser.add_argument("--patching_mode", type=str, default="prune", choices=("prune", "arora"))
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
     parser.add_argument("--run_exact", action="store_true", help="legacy flag: add exact to selected settings")
@@ -58,6 +72,15 @@ def main(argv: List[str] | None = None) -> None:
     )
     parser.add_argument("--dp_leaf_workers", type=int, default=16, help="onepass: number of workers for leaf exact solve")
     parser.add_argument("--dp_parse_mode", type=str, default="catalog_enum", choices=("catalog_enum", "heuristic"), help="onepass: PARSE mode")
+    parser.add_argument("--teacher_data_pt", type=str, default=None, help="training_cost: explicit teacher-data dataset path")
+    parser.add_argument("--teacher_sample_idx", type=int, default=0, help="training_cost: teacher timing start sample index")
+    parser.add_argument("--teacher_sample_idx_end", type=int, default=None, help="training_cost: teacher timing end sample index")
+    parser.add_argument("--teacher_num_workers", type=int, default=None, help="training_cost: teacher timing workers")
+    parser.add_argument("--teacher_lkh_runs", type=int, default=None, help="training_cost: override teacher LKH runs")
+    parser.add_argument("--teacher_lkh_timeout", type=float, default=None, help="training_cost: override teacher LKH timeout in seconds")
+    parser.add_argument("--num_gpus_override", type=int, default=None, help="training_cost: override GPU count for GPU-hour calculation")
+    parser.add_argument("--skip_teacher_timing", action="store_true", help="training_cost: skip teacher generation timing")
+    parser.add_argument("--skip_curve_plot", action="store_true", help="training_cost: skip convergence PNG generation")
 
     parser.add_argument("--tsplib_dir", type=str, default="benchmarks/tsplib", help="directory with TSPLIB .tsp files")
     parser.add_argument("--tsplib_set", type=str, default=None, help="TSPLIB preset, for example largest10, paper, all, or largest:25")
@@ -75,6 +98,8 @@ def main(argv: List[str] | None = None) -> None:
     if args.list_settings:
         if args.benchmark == "tsplib":
             tsplib_eval.main(["--list_settings"])
+        elif args.benchmark == "training_cost":
+            print("training_cost benchmark has no preset settings.")
         else:
             synthetic_eval.main(["--list_settings"])
         return
@@ -166,6 +191,71 @@ def main(argv: List[str] | None = None) -> None:
         onepass_eval.main(child_argv)
         return
 
+    if args.benchmark == "twopass_timing":
+        data_pt = args.data_pt
+        if not data_pt:
+            if args.synthetic_n is None:
+                parser.error(
+                    "--synthetic_n or --data_pt required "
+                    "for --benchmark twopass_timing"
+                )
+            data_pt = resolve_synthetic_raw_data_path(
+                synthetic_n=int(args.synthetic_n),
+                synthetic_data_root=str(args.synthetic_data_root),
+            )
+        child_argv = [
+            "--ckpt", str(args.ckpt),
+            "--data_pt", str(data_pt),
+            "--sample_idx", str(args.sample_idx),
+            "--r", str(args.r),
+            "--device", str(args.device),
+            "--lkh_exe", str(args.lkh_exe),
+            "--num_workers", str(args.num_workers),
+            "--spanner_mode", str(args.spanner_mode),
+            "--theta_k", str(args.theta_k),
+            "--patching_mode", str(args.patching_mode),
+            "--output_dir", str(args.output_dir or "outputs/eval_twopass_timing"),
+        ]
+        if args.sample_idx_end is not None:
+            child_argv += ["--sample_idx_end", str(args.sample_idx_end)]
+        if args.run_tag:
+            child_argv += ["--run_tag", str(args.run_tag)]
+        if args.use_iface_in_decode is not None:
+            child_argv += ["--use_iface_in_decode", str(args.use_iface_in_decode)]
+        twopass_timing_eval.main(child_argv)
+        return
+
+    if args.benchmark == "training_cost":
+        teacher_data_pt = args.teacher_data_pt or args.data_pt
+        child_argv = [
+            "--ckpt", str(args.ckpt),
+            "--log_dir", "checkpoints",
+            "--lkh_exe", str(args.lkh_exe),
+            "--output_dir", str(args.output_dir or "outputs/eval_training_cost"),
+        ]
+        if teacher_data_pt:
+            child_argv += ["--teacher_data_pt", str(teacher_data_pt)]
+        if args.run_tag:
+            child_argv += ["--run_tag", str(args.run_tag)]
+        if args.teacher_sample_idx is not None:
+            child_argv += ["--teacher_sample_idx", str(args.teacher_sample_idx)]
+        if args.teacher_sample_idx_end is not None:
+            child_argv += ["--teacher_sample_idx_end", str(args.teacher_sample_idx_end)]
+        if args.teacher_num_workers is not None:
+            child_argv += ["--teacher_num_workers", str(args.teacher_num_workers)]
+        if args.teacher_lkh_runs is not None:
+            child_argv += ["--teacher_lkh_runs", str(args.teacher_lkh_runs)]
+        if args.teacher_lkh_timeout is not None:
+            child_argv += ["--teacher_lkh_timeout", str(args.teacher_lkh_timeout)]
+        if args.num_gpus_override is not None:
+            child_argv += ["--num_gpus_override", str(args.num_gpus_override)]
+        if args.skip_teacher_timing:
+            child_argv.append("--skip_teacher_timing")
+        if args.skip_curve_plot:
+            child_argv.append("--skip_curve_plot")
+        training_cost_eval.main(child_argv)
+        return
+
     child_argv = [
         "--ckpt", str(args.ckpt),
         "--tsplib_dir", str(args.tsplib_dir),
@@ -174,6 +264,9 @@ def main(argv: List[str] | None = None) -> None:
         "--r", str(args.r),
         "--lkh_exe", str(args.lkh_exe),
         "--num_workers", str(args.num_workers),
+        "--spanner_mode", str(args.spanner_mode),
+        "--theta_k", str(args.theta_k),
+        "--patching_mode", str(args.patching_mode),
         "--exact_time_limit", str(args.exact_time_limit),
         "--exact_length_weight", str(args.exact_length_weight),
         "--save_dir", str(args.output_dir or "outputs/eval_tsplib"),

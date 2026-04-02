@@ -27,6 +27,7 @@ try:
     from src.models.node_token_packer import PackedBatch, PackedLeafPoints, PackedNodeTokens
 except Exception:  # pragma: no cover
     from .node_token_packer import PackedBatch, PackedLeafPoints, PackedNodeTokens
+from .shared_tree import build_leaf_row_for_node, extract_z, gather_node_fields
 
 
 @runtime_checkable
@@ -81,45 +82,27 @@ class BottomUpResult:
     node_ptr: Tensor
     aux: Dict[str, Tensor]
 
-
-def _extract_z(out: Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]) -> Tuple[Tensor, Dict[str, Tensor]]:
-    if torch.is_tensor(out):
-        return out, {}
-    if isinstance(out, tuple) and len(out) == 2 and torch.is_tensor(out[0]) and isinstance(out[1], dict):
-        return out[0], out[1]
-    raise TypeError("Encoder output must be Tensor or (Tensor, dict).")
-
-
-def _build_leaf_row_for_node(total_M: int, leaf_node_id: Tensor) -> Tensor:
-    device = leaf_node_id.device
-    leaf_row_for_node = torch.full((total_M,), -1, dtype=torch.long, device=device)
-    if leaf_node_id.numel() == 0:
-        return leaf_row_for_node
-    uniq = torch.unique(leaf_node_id)
-    if uniq.numel() != leaf_node_id.numel():
-        raise ValueError("leaves.leaf_node_id contains duplicates; expected unique ids.")
-    leaf_row_for_node[leaf_node_id] = torch.arange(leaf_node_id.numel(), device=device, dtype=torch.long)
-    return leaf_row_for_node
-
-
-def _find_roots_per_graph(tree_parent_index: Tensor, node_ptr: Tensor) -> Tensor:
-    device = tree_parent_index.device
-    B = int(node_ptr.numel() - 1)
-    root_ids = torch.empty((B,), dtype=torch.long, device=device)
-    for b in range(B):
-        lo = int(node_ptr[b].item())
-        hi = int(node_ptr[b + 1].item())
-        seg = tree_parent_index[lo:hi]
-        roots = torch.nonzero(seg < 0, as_tuple=False).flatten()
-        if roots.numel() != 1:
-            raise ValueError(f"Expected 1 root in graph {b}, found {int(roots.numel())}.")
-        root_ids[b] = lo + roots[0]
-    return root_ids
-
-
 class BottomUpTreeRunner:
-    def __init__(self, *, validate_completeness: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        validate_completeness: bool = True,
+        max_leaf_batch: Optional[int] = None,
+        max_internal_batch: Optional[int] = None,
+    ) -> None:
         self.validate_completeness = bool(validate_completeness)
+        self.max_leaf_batch = (None if max_leaf_batch is None else int(max_leaf_batch))
+        self.max_internal_batch = (None if max_internal_batch is None else int(max_internal_batch))
+
+    @staticmethod
+    def _iter_chunks(nids: Tensor, chunk_size: Optional[int]):
+        if chunk_size is None or int(chunk_size) <= 0 or int(nids.numel()) <= int(chunk_size):
+            yield nids
+            return
+        chunk_size = int(chunk_size)
+        total = int(nids.numel())
+        for start in range(0, total, chunk_size):
+            yield nids[start:start + chunk_size]
 
     def run_single(
         self,
@@ -186,25 +169,10 @@ class BottomUpTreeRunner:
         total_M = int(tokens.tree_parent_index.numel())
         computed = torch.zeros((total_M,), dtype=torch.bool, device=device)
 
-        leaf_row_for_node = _build_leaf_row_for_node(total_M, leaves.leaf_node_id)
+        leaf_row_for_node = build_leaf_row_for_node(total_M, leaves.leaf_node_id)
 
         depth = tokens.tree_node_depth.long()
         max_depth = int(depth.max().item()) if depth.numel() > 0 else 0
-
-        def gather_node_fields(nids: Tensor) -> Dict[str, Tensor]:
-            return {
-                "node_feat_rel": tokens.tree_node_feat_rel[nids],
-                "node_depth": tokens.tree_node_depth[nids],
-                "iface_feat6": tokens.iface_feat6[nids],
-                "iface_mask": tokens.iface_mask[nids],
-                "iface_boundary_dir": tokens.iface_boundary_dir[nids],
-                "iface_inside_endpoint": tokens.iface_inside_endpoint[nids],
-                "iface_inside_quadrant": tokens.iface_inside_quadrant[nids],
-                "cross_feat6": tokens.cross_feat6[nids],
-                "cross_mask": tokens.cross_mask[nids],
-                "cross_child_pair": tokens.cross_child_pair[nids],
-                "cross_is_leaf_internal": tokens.cross_is_leaf_internal[nids],
-            }
 
         z: Optional[Tensor] = None
         aux: Dict[str, Tensor] = {}
@@ -220,62 +188,63 @@ class BottomUpTreeRunner:
 
             # 1) Leaves
             if leaf_nids.numel() > 0:
-                rows = leaf_row_for_node[leaf_nids]
-                if (rows < 0).any().item():
-                    bad = leaf_nids[rows < 0][:20].tolist()
-                    raise ValueError(f"Missing leaf rows for leaf nodes (up to 20): {bad}")
+                for leaf_chunk in self._iter_chunks(leaf_nids, self.max_leaf_batch):
+                    rows = leaf_row_for_node[leaf_chunk]
+                    if (rows < 0).any().item():
+                        bad = leaf_chunk[rows < 0][:20].tolist()
+                        raise ValueError(f"Missing leaf rows for leaf nodes (up to 20): {bad}")
 
-                leaf_inputs = gather_node_fields(leaf_nids)
-                leaf_inputs.update({
-                    "leaf_points_xy": leaves.point_xy[rows],
-                    "leaf_points_mask": leaves.point_mask[rows],
-                })
-                out = leaf_encoder(**leaf_inputs)
-                z_leaf, aux_leaf = _extract_z(out)
+                    leaf_inputs = gather_node_fields(tokens, leaf_chunk)
+                    leaf_inputs.update({
+                        "leaf_points_xy": leaves.point_xy[rows],
+                        "leaf_points_mask": leaves.point_mask[rows],
+                    })
+                    out = leaf_encoder(**leaf_inputs)
+                    z_leaf, aux_leaf = extract_z(out)
 
-                if z is None:
-                    z = torch.zeros((total_M, z_leaf.shape[1]), dtype=z_leaf.dtype, device=device)
+                    if z is None:
+                        z = torch.zeros((total_M, z_leaf.shape[1]), dtype=z_leaf.dtype, device=device)
 
-                # DIFFERENTIABLE write-back
-                z = z.index_copy(0, leaf_nids, z_leaf)
-                computed[leaf_nids] = True
+                    # DIFFERENTIABLE write-back
+                    z = z.index_copy(0, leaf_chunk, z_leaf)
+                    computed[leaf_chunk] = True
 
-                if aux_leaf:
-                    aux[f"leaf_depth_{d}"] = torch.tensor(1, device=device)
+                    if aux_leaf:
+                        aux[f"leaf_depth_{d}"] = torch.tensor(1, device=device)
 
             # 2) Internal nodes
             if internal_nids.numel() > 0:
                 if z is None:
                     raise RuntimeError("Internal node encountered before any leaf was encoded.")
+                for internal_chunk in self._iter_chunks(internal_nids, self.max_internal_batch):
+                    ch = tokens.tree_children_index[internal_chunk].long()  # [B,4]
+                    child_mask = ch >= 0                                    # [B,4]
+                    ch_clamped = ch.clamp_min(0)
 
-                ch = tokens.tree_children_index[internal_nids].long()  # [B,4]
-                child_mask = ch >= 0                                  # [B,4]
-                ch_clamped = ch.clamp_min(0)
+                    # DIFFERENTIABLE gather (no in-place into child_z)
+                    child_z = z[ch_clamped]  # [B,4,d]
+                    child_z = child_z * child_mask.unsqueeze(-1).to(dtype=child_z.dtype)
 
-                # DIFFERENTIABLE gather (no in-place into child_z)
-                child_z = z[ch_clamped]  # [B,4,d]
-                child_z = child_z * child_mask.unsqueeze(-1).to(dtype=child_z.dtype)
+                    # Sanity: ensure required children already computed
+                    if not computed[ch_clamped[child_mask]].all().item():
+                        missing = ch_clamped[child_mask][~computed[ch_clamped[child_mask]]][:20].tolist()
+                        raise RuntimeError(f"Some children not computed before parent at depth {d}. Example: {missing}")
 
-                # Sanity: ensure required children already computed
-                if not computed[ch_clamped[child_mask]].all().item():
-                    missing = ch_clamped[child_mask][~computed[ch_clamped[child_mask]]][:20].tolist()
-                    raise RuntimeError(f"Some children not computed before parent at depth {d}. Example: {missing}")
+                    merge_inputs = gather_node_fields(tokens, internal_chunk)
+                    merge_inputs.update({
+                        "child_z": child_z,
+                        "child_mask": child_mask,
+                    })
 
-                merge_inputs = gather_node_fields(internal_nids)
-                merge_inputs.update({
-                    "child_z": child_z,
-                    "child_mask": child_mask,
-                })
+                    out = merge_encoder(**merge_inputs)
+                    z_parent, aux_merge = extract_z(out)
 
-                out = merge_encoder(**merge_inputs)
-                z_parent, aux_merge = _extract_z(out)
+                    # DIFFERENTIABLE write-back
+                    z = z.index_copy(0, internal_chunk, z_parent)
+                    computed[internal_chunk] = True
 
-                # DIFFERENTIABLE write-back
-                z = z.index_copy(0, internal_nids, z_parent)
-                computed[internal_nids] = True
-
-                if aux_merge:
-                    aux[f"merge_depth_{d}"] = torch.tensor(1, device=device)
+                    if aux_merge:
+                        aux[f"merge_depth_{d}"] = torch.tensor(1, device=device)
 
         if z is None:
             z = torch.zeros((total_M, 1), dtype=torch.float32, device=device)

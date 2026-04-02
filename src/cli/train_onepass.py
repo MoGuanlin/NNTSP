@@ -33,53 +33,11 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-
-# ─── Shared utilities from train.py ──────────────────────────────────────────
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if str(device_arg).startswith("cuda") and torch.cuda.is_available():
-        return torch.device(device_arg)
-    return torch.device("cpu")
-
-
-def move_data_tensors_to_device(data: Any, device: torch.device) -> Any:
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, torch.Tensor):
-                data[k] = v.to(device)
-            elif v is not None:
-                move_data_tensors_to_device(v, device)
-        return data
-    if isinstance(data, list):
-        for i, v in enumerate(data):
-            if isinstance(v, torch.Tensor):
-                data[i] = v.to(device)
-            elif v is not None:
-                move_data_tensors_to_device(v, device)
-        return data
-    skip = {"num_faces"}
-    for k in dir(data):
-        if k.startswith("_") or k in skip:
-            continue
-        try:
-            v = getattr(data, k, None)
-        except Exception:
-            continue
-        if isinstance(v, torch.Tensor):
-            try:
-                setattr(data, k, v.to(device))
-            except Exception:
-                pass
-        elif v is not None and (hasattr(v, "__dict__") or isinstance(v, (dict, list))):
-            move_data_tensors_to_device(v, device)
-    return data
-
+from src.cli.common import move_data_tensors_to_device, resolve_device, set_seed
+from src.cli.model_factory import (
+    build_onepass_training_models,
+    restore_onepass_checkpoint_state,
+)
 
 # ─── Worker for DataLoader ───────────────────────────────────────────────────
 
@@ -434,6 +392,12 @@ def main() -> None:
     # Logging & checkpointing
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument(
+        "--keep_ckpt_interval",
+        type=int,
+        default=10000,
+        help="save an extra non-rotating checkpoint copy every N steps (0 disables)",
+    )
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")
     parser.add_argument("--num_checkpoints", type=int, default=10)
 
@@ -465,9 +429,6 @@ def main() -> None:
 
     # ─── Imports ──────────────────────────────────────────────────────
     from src.models.node_token_packer import NodeTokenPacker
-    from src.models.leaf_encoder import LeafEncoder
-    from src.models.merge_encoder import MergeEncoder
-    from src.models.merge_decoder import MergeDecoder
     from src.models.onepass_trainer import (
         OnePassTrainRunner,
         build_child_iface_targets_from_states,
@@ -488,16 +449,17 @@ def main() -> None:
     )
 
     # ─── Models ───────────────────────────────────────────────────────
-    leaf_encoder = LeafEncoder(d_model=d).to(device)
-    merge_encoder = MergeEncoder(d_model=d).to(device)
-    merge_decoder = MergeDecoder(
+    model_bundle = build_onepass_training_models(
+        device=device,
         d_model=d,
-        n_heads=max(4, d // 32),
-        num_iface_slots=Ti,
+        r=r,
+        matching_max_used=int(args.matching_max_used),
         parent_num_layers=int(args.parent_num_layers),
         cross_num_layers=int(args.cross_num_layers),
-        max_depth=64,
-    ).to(device)
+    )
+    leaf_encoder = model_bundle.leaf_encoder
+    merge_encoder = model_bundle.merge_encoder
+    merge_decoder = model_bundle.merge_decoder
 
     runner = OnePassTrainRunner()
 
@@ -576,12 +538,14 @@ def main() -> None:
     if args.ckpt:
         log(f"[ckpt] Loading from {args.ckpt}")
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
-        merge_encoder.load_state_dict(ckpt["merge_encoder"])
-        if "merge_decoder" in ckpt:
-            merge_decoder.load_state_dict(ckpt["merge_decoder"])
-        if "opt" in ckpt:
-            opt.load_state_dict(ckpt["opt"])
+        restore_onepass_checkpoint_state(
+            ckpt=ckpt,
+            leaf_encoder=leaf_encoder,
+            merge_encoder=merge_encoder,
+            merge_decoder=merge_decoder,
+            opt=opt,
+            load_optimizer=True,
+        )
         log("[ckpt] Loaded.")
 
     # ─── Pre-compute or streaming DataLoader ─────────────────────────
@@ -634,7 +598,19 @@ def main() -> None:
     t0 = time.time()
     recent_ckpts: List[Path] = []
     MAX_RECENT = int(args.num_checkpoints)
+    keep_ckpt_interval = int(args.keep_ckpt_interval)
     pw = float(args.pos_weight) if float(args.pos_weight) > 0 else None
+
+    def _checkpoint_payload(epoch_value: int) -> Dict[str, Any]:
+        return {
+            "step": global_step,
+            "epoch": epoch_value,
+            "args": vars(args),
+            "leaf_encoder": leaf_encoder.state_dict(),
+            "merge_encoder": merge_encoder.state_dict(),
+            "merge_decoder": merge_decoder.state_dict(),
+            "opt": opt.state_dict(),
+        }
 
     log(f"[train] Starting 1-pass training: {args.epochs} epochs, bs={args.batch_size}")
     log(f"[train] Models: LeafEnc + MergeEnc + MergeDecoder (d={d}, Ti={Ti})")
@@ -744,18 +720,8 @@ def main() -> None:
             # Save
             if global_step % int(args.save_interval) == 0:
                 ckpt_path = ckpt_dir / f"ckpt_step_{global_step}.pt"
-                torch.save(
-                    {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "args": vars(args),
-                        "leaf_encoder": leaf_encoder.state_dict(),
-                        "merge_encoder": merge_encoder.state_dict(),
-                        "merge_decoder": merge_decoder.state_dict(),
-                        "opt": opt.state_dict(),
-                    },
-                    ckpt_path,
-                )
+                payload = _checkpoint_payload(epoch)
+                torch.save(payload, ckpt_path)
                 log(f"[ckpt] saved → {ckpt_path}")
                 recent_ckpts.append(ckpt_path)
                 if len(recent_ckpts) > MAX_RECENT:
@@ -765,6 +731,11 @@ def main() -> None:
                             os.remove(oldest)
                         except Exception:
                             pass
+
+            if keep_ckpt_interval > 0 and global_step % keep_ckpt_interval == 0:
+                keep_path = ckpt_dir / f"ckpt_keep_step_{global_step}.pt"
+                torch.save(_checkpoint_payload(epoch), keep_path)
+                log(f"[ckpt] permanent saved → {keep_path}")
 
             # Free GPU memory: move_data_tensors_to_device mutates the
             # cached batch in-place, so every processed batch accumulates
@@ -778,18 +749,7 @@ def main() -> None:
 
     # Final save
     ckpt_path = ckpt_dir / f"ckpt_final_step_{global_step}.pt"
-    torch.save(
-        {
-            "step": global_step,
-            "epoch": int(args.epochs),
-            "args": vars(args),
-            "leaf_encoder": leaf_encoder.state_dict(),
-            "merge_encoder": merge_encoder.state_dict(),
-            "merge_decoder": merge_decoder.state_dict(),
-            "opt": opt.state_dict(),
-        },
-        ckpt_path,
-    )
+    torch.save(_checkpoint_payload(int(args.epochs)), ckpt_path)
     log(f"[ckpt] Final saved → {ckpt_path}")
     log("[done] 1-pass training finished.")
 

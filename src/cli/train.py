@@ -38,7 +38,6 @@ DO NOT RE-ENABLE "use_pickle" IN DATASET OR REMOVE WORKER IPC OPTIMIZATIONS.
 from __future__ import annotations
 
 import argparse
-import random
 import time
 import warnings
 import datetime
@@ -54,73 +53,12 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def parse_bool_arg(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if str(device_arg).startswith("cuda") and torch.cuda.is_available():
-        return torch.device(device_arg)
-    return torch.device("cpu")
-
-
-def move_data_tensors_to_device(data: Any, device: torch.device) -> Any:
-    # Handle Dict
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if isinstance(v, torch.Tensor):
-                data[k] = v.to(device)
-            elif v is not None:
-                move_data_tensors_to_device(v, device)
-        return data
-
-    # Handle List
-    if isinstance(data, list):
-        for i, v in enumerate(data):
-            if isinstance(v, torch.Tensor):
-                data[i] = v.to(device)
-            elif v is not None:
-                move_data_tensors_to_device(v, device)
-        return data
-
-    # Avoid touching PyG deprecated virtual attrs (e.g., num_faces)
-    skip = {"num_faces"}
-    for k in dir(data):
-        if k.startswith("_") or k in skip:
-            continue
-        try:
-            v = getattr(data, k, None)
-        except Exception:
-            continue
-        if isinstance(v, torch.Tensor):
-            try:
-                setattr(data, k, v.to(device))
-            except Exception:
-                pass
-        elif v is not None and (hasattr(v, "__dict__") or isinstance(v, (dict, list))):
-            # Recurse into nested objects, dicts or lists (e.g., PackedBatch.tokens or TokenLabels.stats)
-            move_data_tensors_to_device(v, device)
-    return data
-
-
-def load_list_pt(path: str) -> FastTSPDataset:
-    from src.dataprep.dataset import smart_load_dataset
-    return smart_load_dataset(path)
+from src.cli.common import move_data_tensors_to_device, parse_bool_arg, resolve_device, set_seed
+from src.cli.model_factory import (
+    build_twopass_training_models,
+    inspect_twopass_resume_checkpoint,
+    restore_twopass_checkpoint_state,
+)
 
 
 
@@ -997,24 +935,14 @@ def main() -> None:
     resume_ckpt = None
     if args.ckpt and str(args.ckpt).lower() != "none":
         print(f"[ckpt] inspecting architecture config from {args.ckpt}")
-        resume_ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        ckpt_args = dict(resume_ckpt.get("args", {}))
-        if "td_mode" in ckpt_args and str(args.td_mode) != str(ckpt_args["td_mode"]):
-            print(f"[ckpt] overriding td_mode: {args.td_mode} -> {ckpt_args['td_mode']}")
-            args.td_mode = ckpt_args["td_mode"]
-        if "state_mode" in ckpt_args and str(args.state_mode) != str(ckpt_args["state_mode"]):
-            print(f"[ckpt] overriding state_mode: {args.state_mode} -> {ckpt_args['state_mode']}")
-            args.state_mode = ckpt_args["state_mode"]
-        if "matching_max_used" in ckpt_args and int(args.matching_max_used) != int(ckpt_args["matching_max_used"]):
-            print(f"[ckpt] overriding matching_max_used: {args.matching_max_used} -> {ckpt_args['matching_max_used']}")
-            args.matching_max_used = int(ckpt_args["matching_max_used"])
+        resume_ckpt = inspect_twopass_resume_checkpoint(
+            ckpt_path=args.ckpt,
+            args=args,
+            emit=print,
+        )
 
-    from src.models.bc_state_catalog import infer_boundary_state_count
     from src.models.node_token_packer import NodeTokenPacker
-    from src.models.leaf_encoder import LeafEncoder
-    from src.models.merge_encoder import MergeEncoder
     from src.models.bottom_up_runner import BottomUpTreeRunner
-    from src.models.top_down_decoder import TopDownDecoder
     from src.models.top_down_runner import TopDownTreeRunner
     from src.models.labeler import PseudoLabeler
     from src.models.losses import dp_token_losses, masked_bce_with_logits, masked_ce_with_logits
@@ -1026,19 +954,17 @@ def main() -> None:
         matching_max_used=int(args.matching_max_used),
     )
 
-    leaf_encoder = LeafEncoder(d_model=128).to(device)
-    merge_encoder = MergeEncoder(d_model=128).to(device)
-
-    # NOTE: new TopDownDecoder no longer takes "r=..."; mode switch here.
-    num_states = None
-    if str(args.state_mode) == "matching":
-        num_states = infer_boundary_state_count(num_slots=4 * int(args.r), max_used=int(args.matching_max_used))
-    decoder = TopDownDecoder(
-        d_model=128,
-        mode=str(args.td_mode),
+    model_bundle = build_twopass_training_models(
+        device=device,
+        r=int(args.r),
+        td_mode=str(args.td_mode),
         state_mode=str(args.state_mode),
-        num_states=num_states,
-    ).to(device)
+        matching_max_used=int(args.matching_max_used),
+        d_model=128,
+    )
+    leaf_encoder = model_bundle.leaf_encoder
+    merge_encoder = model_bundle.merge_encoder
+    decoder = model_bundle.decoder
 
     bu_runner = BottomUpTreeRunner()
     td_runner = TopDownTreeRunner()
@@ -1095,12 +1021,14 @@ def main() -> None:
 
     if resume_ckpt is not None:
         print(f"[ckpt] loading from {args.ckpt}")
-        ckpt = resume_ckpt
-        leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
-        merge_encoder.load_state_dict(ckpt["merge_encoder"])
-        decoder.load_state_dict(ckpt["decoder"])
-        if "opt" in ckpt and not args.eval_only:
-            opt.load_state_dict(ckpt["opt"])
+        restore_twopass_checkpoint_state(
+            ckpt=resume_ckpt,
+            leaf_encoder=leaf_encoder,
+            merge_encoder=merge_encoder,
+            decoder=decoder,
+            opt=opt,
+            load_optimizer=not args.eval_only,
+        )
         print("[ckpt] loaded.")
 
     if args.eval_only:

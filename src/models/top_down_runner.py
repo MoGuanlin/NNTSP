@@ -65,8 +65,24 @@ class TopDownResult:
 
 
 class TopDownTreeRunner:
-    def __init__(self, *, validate_reachability: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        validate_reachability: bool = True,
+        max_nodes_per_chunk: Optional[int] = None,
+    ) -> None:
         self.validate_reachability = bool(validate_reachability)
+        self.max_nodes_per_chunk = (None if max_nodes_per_chunk is None else int(max_nodes_per_chunk))
+
+    @staticmethod
+    def _iter_chunks(nids: Tensor, chunk_size: Optional[int]):
+        if chunk_size is None or int(chunk_size) <= 0 or int(nids.numel()) <= int(chunk_size):
+            yield nids
+            return
+        chunk_size = int(chunk_size)
+        total = int(nids.numel())
+        for start in range(0, total, chunk_size):
+            yield nids[start:start + chunk_size]
 
     def run_batch(
         self,
@@ -199,109 +215,109 @@ class TopDownTreeRunner:
             node_ids = torch.nonzero((tokens.tree_node_depth == d) & reached, as_tuple=False).view(-1)
             if node_ids.numel() == 0:
                 continue
+            for node_chunk in self._iter_chunks(node_ids, self.max_nodes_per_chunk):
+                # ---- gather parent node inputs ----
+                node_feat_rel = tokens.tree_node_feat_rel[node_chunk]     # [B,4]
+                node_depth = tokens.tree_node_depth[node_chunk]           # [B]
+                z_node = z[node_chunk]                                    # [B,d]
 
-            # ---- gather parent node inputs ----
-            node_feat_rel = tokens.tree_node_feat_rel[node_ids]     # [B,4]
-            node_depth = tokens.tree_node_depth[node_ids]           # [B]
-            z_node = z[node_ids]                                    # [B,d]
+                bc_in = bc_iface_logit[node_chunk]                        # [B,Ti]
+                state_mask = tokens.state_mask[node_chunk].bool() if use_matching else None
+                bc_in_state = bc_state_logit[node_chunk] if use_matching and bc_state_logit is not None else None
 
-            bc_in = bc_iface_logit[node_ids]                        # [B,Ti]
-            state_mask = tokens.state_mask[node_ids].bool() if use_matching else None
-            bc_in_state = bc_state_logit[node_ids] if use_matching and bc_state_logit is not None else None
+                iface_feat6 = tokens.iface_feat6[node_chunk]              # [B,Ti,6]
+                iface_mask = tokens.iface_mask[node_chunk].bool()         # [B,Ti]
+                iface_boundary_dir = tokens.iface_boundary_dir[node_chunk]
+                iface_inside_endpoint = tokens.iface_inside_endpoint[node_chunk]
+                iface_inside_quadrant = tokens.iface_inside_quadrant[node_chunk]
 
-            iface_feat6 = tokens.iface_feat6[node_ids]              # [B,Ti,6]
-            iface_mask = tokens.iface_mask[node_ids].bool()         # [B,Ti]
-            iface_boundary_dir = tokens.iface_boundary_dir[node_ids]
-            iface_inside_endpoint = tokens.iface_inside_endpoint[node_ids]
-            iface_inside_quadrant = tokens.iface_inside_quadrant[node_ids]
+                cross_feat6 = tokens.cross_feat6[node_chunk]              # [B,Tc,6]
+                cross_mask = tokens.cross_mask[node_chunk].bool()         # [B,Tc]
+                cross_child_pair = tokens.cross_child_pair[node_chunk]    # [B,Tc,2]
+                cross_is_leaf_internal = tokens.cross_is_leaf_internal[node_chunk]  # [B,Tc]
 
-            cross_feat6 = tokens.cross_feat6[node_ids]              # [B,Tc,6]
-            cross_mask = tokens.cross_mask[node_ids].bool()         # [B,Tc]
-            cross_child_pair = tokens.cross_child_pair[node_ids]    # [B,Tc,2]
-            cross_is_leaf_internal = tokens.cross_is_leaf_internal[node_ids]  # [B,Tc]
+                # ---- gather children inputs ----
+                children = tokens.tree_children_index[node_chunk].long()  # [B,4]
+                child_exists = (children >= 0)                            # [B,4]
+                children_clamped = children.clamp_min(0)
 
-            # ---- gather children inputs ----
-            children = tokens.tree_children_index[node_ids].long()  # [B,4]
-            child_exists = (children >= 0)                          # [B,4]
-            children_clamped = children.clamp_min(0)
+                child_z = z[children_clamped]                             # [B,4,d]
+                child_z = child_z * child_exists.unsqueeze(-1).to(dtype=dtype)
 
-            child_z = z[children_clamped]                           # [B,4,d]
-            child_z = child_z * child_exists.unsqueeze(-1).to(dtype=dtype)
+                child_node_feat_rel = tokens.tree_node_feat_rel[children_clamped]  # [B,4,4]
+                child_node_feat_rel = child_node_feat_rel * child_exists.unsqueeze(-1).to(dtype=dtype)
 
-            child_node_feat_rel = tokens.tree_node_feat_rel[children_clamped]  # [B,4,4]
-            child_node_feat_rel = child_node_feat_rel * child_exists.unsqueeze(-1).to(dtype=dtype)
+                child_node_depth = tokens.tree_node_depth[children_clamped]        # [B,4]
+                child_node_depth = child_node_depth * child_exists.to(dtype=child_node_depth.dtype)
 
-            child_node_depth = tokens.tree_node_depth[children_clamped]        # [B,4]
-            child_node_depth = child_node_depth * child_exists.to(dtype=child_node_depth.dtype)
-
-            # child iface tokens (stable order per child is guaranteed by packer)
-            child_iface_feat6 = tokens.iface_feat6[children_clamped]           # [B,4,Ti,6]
-            child_iface_mask = tokens.iface_mask[children_clamped].bool()      # [B,4,Ti]
-            child_iface_mask = child_iface_mask & child_exists.unsqueeze(-1)   # AND exist
-            child_iface_boundary_dir = tokens.iface_boundary_dir[children_clamped]
-            child_iface_inside_endpoint = tokens.iface_inside_endpoint[children_clamped]
-            child_iface_inside_quadrant = tokens.iface_inside_quadrant[children_clamped]
-            child_state_mask = None
-            if use_matching:
-                child_state_mask = tokens.state_mask[children_clamped].bool()
-                child_state_mask = child_state_mask & child_exists.unsqueeze(-1)
-
-            out: TopDownDecoderOutput = decoder(
-                node_feat_rel=node_feat_rel,
-                node_depth=node_depth,
-                z_node=z_node,
-                iface_feat6=iface_feat6,
-                iface_mask=iface_mask,
-                iface_boundary_dir=iface_boundary_dir,
-                iface_inside_endpoint=iface_inside_endpoint,
-                iface_inside_quadrant=iface_inside_quadrant,
-                cross_feat6=cross_feat6,
-                cross_mask=cross_mask,
-                cross_child_pair=cross_child_pair,
-                cross_is_leaf_internal=cross_is_leaf_internal,
-                bc_in_iface_logit=bc_in,
-                child_z=child_z,
-                child_exists_mask=child_exists,
-                child_node_feat_rel=child_node_feat_rel,
-                child_node_depth=child_node_depth,
-                child_iface_feat6=child_iface_feat6,
-                child_iface_mask=child_iface_mask,
-                child_iface_boundary_dir=child_iface_boundary_dir,
-                child_iface_inside_endpoint=child_iface_inside_endpoint,
-                child_iface_inside_quadrant=child_iface_inside_quadrant,
-                bc_in_state_logit=bc_in_state,
-                state_mask=state_mask,
-                state_used_iface=state_used_iface,
-                child_state_mask=child_state_mask,
-            )
-
-            # write back local logits (differentiable)
-            iface_logit = iface_logit.index_copy(0, node_ids, out.iface_logit)
-            cross_logit = cross_logit.index_copy(0, node_ids, out.cross_logit)
-
-            # propagate child bc logits (differentiable)
-            flat_children = children.view(-1)
-            flat_valid = flat_children >= 0
-            if flat_valid.any().item():
-                flat_cids = flat_children[flat_valid].long()                    # [K]
+                # child iface tokens (stable order per child is guaranteed by packer)
+                child_iface_feat6 = tokens.iface_feat6[children_clamped]           # [B,4,Ti,6]
+                child_iface_mask = tokens.iface_mask[children_clamped].bool()      # [B,4,Ti]
+                child_iface_mask = child_iface_mask & child_exists.unsqueeze(-1)   # AND exist
+                child_iface_boundary_dir = tokens.iface_boundary_dir[children_clamped]
+                child_iface_inside_endpoint = tokens.iface_inside_endpoint[children_clamped]
+                child_iface_inside_quadrant = tokens.iface_inside_quadrant[children_clamped]
+                child_state_mask = None
                 if use_matching:
-                    if out.child_state_logit is None or child_state_mask is None or bc_state_logit is None or state_used_iface is None:
-                        raise RuntimeError("matching mode decoder must return child_state_logit.")
-                    flat_child_state = out.child_state_logit.view(-1, out.child_state_logit.shape[-1])[flat_valid]
-                    flat_child_state_mask = child_state_mask.view(-1, child_state_mask.shape[-1])[flat_valid]
-                    bc_state_logit = bc_state_logit.index_copy(0, flat_cids, flat_child_state)
-                    flat_child_bc = state_logits_to_expected_iface_usage(
-                        state_logit=flat_child_state,
-                        state_mask=flat_child_state_mask,
-                        state_used_iface=state_used_iface,
-                    )
-                    child_iface_valid = tokens.iface_mask[flat_cids].bool()
-                    flat_child_bc = torch.where(child_iface_valid, flat_child_bc, torch.full_like(flat_child_bc, _NEG_INF))
-                    bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
-                else:
-                    flat_child_bc = out.child_iface_logit.view(-1, Ti)[flat_valid]  # [K,Ti]
-                    bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
-                reached[flat_cids] = True
+                    child_state_mask = tokens.state_mask[children_clamped].bool()
+                    child_state_mask = child_state_mask & child_exists.unsqueeze(-1)
+
+                out: TopDownDecoderOutput = decoder(
+                    node_feat_rel=node_feat_rel,
+                    node_depth=node_depth,
+                    z_node=z_node,
+                    iface_feat6=iface_feat6,
+                    iface_mask=iface_mask,
+                    iface_boundary_dir=iface_boundary_dir,
+                    iface_inside_endpoint=iface_inside_endpoint,
+                    iface_inside_quadrant=iface_inside_quadrant,
+                    cross_feat6=cross_feat6,
+                    cross_mask=cross_mask,
+                    cross_child_pair=cross_child_pair,
+                    cross_is_leaf_internal=cross_is_leaf_internal,
+                    bc_in_iface_logit=bc_in,
+                    child_z=child_z,
+                    child_exists_mask=child_exists,
+                    child_node_feat_rel=child_node_feat_rel,
+                    child_node_depth=child_node_depth,
+                    child_iface_feat6=child_iface_feat6,
+                    child_iface_mask=child_iface_mask,
+                    child_iface_boundary_dir=child_iface_boundary_dir,
+                    child_iface_inside_endpoint=child_iface_inside_endpoint,
+                    child_iface_inside_quadrant=child_iface_inside_quadrant,
+                    bc_in_state_logit=bc_in_state,
+                    state_mask=state_mask,
+                    state_used_iface=state_used_iface,
+                    child_state_mask=child_state_mask,
+                )
+
+                # write back local logits (differentiable)
+                iface_logit = iface_logit.index_copy(0, node_chunk, out.iface_logit)
+                cross_logit = cross_logit.index_copy(0, node_chunk, out.cross_logit)
+
+                # propagate child bc logits (differentiable)
+                flat_children = children.view(-1)
+                flat_valid = flat_children >= 0
+                if flat_valid.any().item():
+                    flat_cids = flat_children[flat_valid].long()                    # [K]
+                    if use_matching:
+                        if out.child_state_logit is None or child_state_mask is None or bc_state_logit is None or state_used_iface is None:
+                            raise RuntimeError("matching mode decoder must return child_state_logit.")
+                        flat_child_state = out.child_state_logit.view(-1, out.child_state_logit.shape[-1])[flat_valid]
+                        flat_child_state_mask = child_state_mask.view(-1, child_state_mask.shape[-1])[flat_valid]
+                        bc_state_logit = bc_state_logit.index_copy(0, flat_cids, flat_child_state)
+                        flat_child_bc = state_logits_to_expected_iface_usage(
+                            state_logit=flat_child_state,
+                            state_mask=flat_child_state_mask,
+                            state_used_iface=state_used_iface,
+                        )
+                        child_iface_valid = tokens.iface_mask[flat_cids].bool()
+                        flat_child_bc = torch.where(child_iface_valid, flat_child_bc, torch.full_like(flat_child_bc, _NEG_INF))
+                        bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
+                    else:
+                        flat_child_bc = out.child_iface_logit.view(-1, Ti)[flat_valid]  # [K,Ti]
+                        bc_iface_logit = bc_iface_logit.index_copy(0, flat_cids, flat_child_bc)
+                    reached[flat_cids] = True
 
         if self.validate_reachability and (not reached.all().item()):
             missing = torch.nonzero(~reached, as_tuple=False).view(-1)[:50].tolist()

@@ -513,6 +513,95 @@ class TestVerifyTuple:
         )
         assert ok is False
 
+    def test_orphan_active_component_rejected(self):
+        """Active child slots not covered by outer tracing/glue must be rejected."""
+        s = _make_simple_scenario()
+        # Delete the two crossings incident to BL so BL can carry an orphan component.
+        s["parent_cross_mask"][1] = False  # disable e4: BL↔BR
+        s["parent_cross_mask"][2] = False  # disable e5: TL↔BL
+        maps = build_correspondence_maps(
+            parent_iface_eid=s["parent_iface_eid"],
+            parent_iface_mask=s["parent_iface_mask"],
+            parent_iface_bdir=s["parent_iface_bdir"],
+            parent_cross_eid=s["parent_cross_eid"],
+            parent_cross_mask=s["parent_cross_mask"],
+            parent_cross_child_pair=s["parent_cross_child_pair"],
+            children_iface_eid=s["children_iface_eid"],
+            children_iface_mask=s["children_iface_mask"],
+            children_iface_bdir=s["children_iface_bdir"],
+            child_exists=s["child_exists"],
+        )
+
+        Ti = s["Ti"]
+
+        # Parent uses a valid TL-only path from LEFT to TOP.
+        parent_a = torch.zeros(Ti, dtype=torch.bool)
+        parent_mate = torch.full((Ti,), -1, dtype=torch.long)
+        parent_a[0] = True
+        parent_a[2] = True
+        parent_mate[0] = 2
+        parent_mate[2] = 0
+
+        child_a = torch.zeros(4, Ti, dtype=torch.bool)
+        child_mate = torch.full((4, Ti), -1, dtype=torch.long)
+
+        # Valid TL path realizing parent 0↔2.
+        child_a[0, 0] = True
+        child_a[0, 1] = True
+        child_mate[0, 0] = 1
+        child_mate[0, 1] = 0
+
+        # Extra BL-local component on slots that no longer map to glue nor parent.
+        child_a[2, 0] = True
+        child_a[2, 1] = True
+        child_mate[2, 0] = 1
+        child_mate[2, 1] = 0
+
+        ok = verify_tuple(
+            parent_a=parent_a,
+            parent_mate=parent_mate,
+            parent_iface_mask=s["parent_iface_mask"],
+            child_a=child_a,
+            child_mate=child_mate,
+            child_iface_mask=s["children_iface_mask"],
+            child_exists=s["child_exists"],
+            maps=maps,
+        )
+        assert ok is False
+
+    def test_root_open_path_rejected(self):
+        """Root with no outer boundary must reject connected-but-open child paths."""
+        s, maps = self._build_maps()
+        Ti = s["Ti"]
+
+        # Root state: no outer boundary slots at all.
+        parent_iface_mask = torch.zeros_like(s["parent_iface_mask"])
+        parent_a = torch.zeros(Ti, dtype=torch.bool)
+        parent_mate = torch.full((Ti,), -1, dtype=torch.long)
+
+        child_a = torch.zeros(4, Ti, dtype=torch.bool)
+        child_mate = torch.full((4, Ti), -1, dtype=torch.long)
+
+        # TL carries an open path between two root-boundary-facing slots.
+        # This is connected locally, but since root has no parent boundary and
+        # these slots have no glue peers, the tuple cannot represent a closed tour.
+        child_a[0, 0] = True
+        child_a[0, 1] = True
+        child_mate[0, 0] = 1
+        child_mate[0, 1] = 0
+
+        ok = verify_tuple(
+            parent_a=parent_a,
+            parent_mate=parent_mate,
+            parent_iface_mask=parent_iface_mask,
+            child_a=child_a,
+            child_mate=child_mate,
+            child_iface_mask=s["children_iface_mask"],
+            child_exists=s["child_exists"],
+            maps=maps,
+        )
+        assert ok is False
+
 
 # ─── Test: Noncrossing matching DP ────────────────────────────────────────────
 

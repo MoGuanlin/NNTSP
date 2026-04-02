@@ -16,25 +16,28 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 
+from src.cli.common import log_progress, move_data_tensors_to_device as to_device, resolve_device
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
+from src.cli.graph_pipeline import (
+    build_spanner_builder,
+    preprocess_points_to_hierarchy,
+    select_effective_edge_index,
+)
+from src.cli.model_factory import load_twopass_eval_models
 from src.graph.build_raw_pyramid import RawPyramidBuilder
-from src.graph.prune_pyramid import prune_r_light_single
-from src.graph.spanner import SpannerBuilder
-from src.models.bc_state_catalog import infer_boundary_state_count
 from src.models.bottom_up_runner import BottomUpTreeRunner
 from src.models.decode_backend import decode_tour
 from src.models.edge_aggregation import aggregate_logits_to_edges
-from src.models.leaf_encoder import LeafEncoder
 from src.models.lkh_decode import TSPLIB_PAPER_RESULTS, solve_with_lkh_parallel
-from src.models.merge_encoder import MergeEncoder
 from src.models.node_token_packer import NodeTokenPacker
-from src.models.top_down_decoder import TopDownDecoder
 from src.models.top_down_runner import TopDownTreeRunner
 
 TSPLIB_INSTANCE_PRESETS = {
     "largest5": {"mode": "largest", "count": 5},
     "largest10": {"mode": "largest", "count": 10},
     "largest20": {"mode": "largest", "count": 20},
+    "n100_500": {"mode": "range", "min_n": 100, "max_n": 500},
+    "small100_500": {"mode": "range", "min_n": 100, "max_n": 500},
     "paper": {"mode": "names", "names": tuple(TSPLIB_PAPER_RESULTS.keys())},
     "all": {"mode": "all"},
 }
@@ -43,6 +46,7 @@ TSPLIB_INSTANCE_PRESETS = {
 AVAILABLE_SETTINGS = (
     "greedy",
     "exact",
+    "spanner_uniform_lkh",
     "guided_lkh",
     "pomo",
     "neurolkh",
@@ -59,14 +63,19 @@ DEFAULT_SETTINGS = (
 
 SETTING_GROUPS = {
     "default": DEFAULT_SETTINGS,
-    "all": ("greedy", "exact", "guided_lkh", "pomo", "neurolkh", "paper_lkh"),
+    "all": ("greedy", "exact", "spanner_uniform_lkh", "guided_lkh", "pomo", "neurolkh", "paper_lkh"),
     "ours": ("greedy", "exact", "guided_lkh"),
     "baselines": ("pomo", "neurolkh"),
     "reference": ("paper_lkh",),
-    "lkh": ("guided_lkh", "paper_lkh"),
+    "lkh": ("spanner_uniform_lkh", "guided_lkh", "paper_lkh"),
+    "practical_lkh": ("spanner_uniform_lkh", "guided_lkh", "paper_lkh"),
 }
 
 SETTING_ALIASES = {
+    "spanner": "spanner_uniform_lkh",
+    "spanner_only": "spanner_uniform_lkh",
+    "spanner_lkh": "spanner_uniform_lkh",
+    "uniform_lkh": "spanner_uniform_lkh",
     "guided": "guided_lkh",
     "guidedlkh": "guided_lkh",
     "paper": "paper_lkh",
@@ -79,60 +88,66 @@ SETTING_ALIASES = {
 SETTING_COLUMNS: Dict[str, List[tuple[str, str, int]]] = {
     "greedy": [("obj", "Greedy Obj", 12), ("gap", "Greedy Gap", 10), ("time", "Time", 7)],
     "exact": [("obj", "Exact Obj", 12), ("gap", "Exact Gap", 10), ("time", "Time", 7)],
+    "spanner_uniform_lkh": [("obj", "Spanner Obj", 12), ("gap", "Spanner Gap", 11), ("time", "Time", 7)],
     "guided_lkh": [("obj", "Guided Obj", 12), ("gap", "Guided Gap", 10), ("time", "Time", 7)],
     "pomo": [("obj", "POMO Obj", 10), ("gap", "POMO Gap", 10), ("time", "Time", 7)],
     "neurolkh": [("obj", "NeuroLKH Obj", 12), ("gap", "NeuroLKH Gap", 12), ("time", "Time", 7)],
     "paper_lkh": [("obj", "Paper Obj", 10), ("time", "Paper Time", 10)],
 }
 
-
-def resolve_device(device_arg: str) -> torch.device:
-    if str(device_arg).startswith("cuda") and torch.cuda.is_available():
-        return torch.device(device_arg)
-    return torch.device("cpu")
-
-
 def parse_tsp_file(path: str) -> np.ndarray:
-    """Minimal TSPLIB parser for EUC_2D."""
+    """Parse 2D coordinates from TSPLIB node/display sections.
+
+    Supports both:
+      - NODE_COORD_SECTION
+      - DISPLAY_DATA_SECTION
+
+    Some TSPLIB instances use EXPLICIT edge weights but still provide
+    DISPLAY_DATA_SECTION for visualization; those coordinates are sufficient for
+    this Euclidean/spanner-based pipeline.
+    """
+    header_re = re.compile(r"^([A-Z_]+)\s*:\s*(.*)$")
     coords = []
+    edge_weight_type = None
+    display_data_type = None
     with open(path, "r") as f:
         in_section = False
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            if "NODE_COORD_SECTION" in line:
+
+            upper = line.upper()
+            header_match = header_re.match(upper)
+            if (not in_section) and header_match:
+                key = header_match.group(1).strip()
+                value = header_match.group(2).strip()
+                if key == "EDGE_WEIGHT_TYPE":
+                    edge_weight_type = value
+                elif key == "DISPLAY_DATA_TYPE":
+                    display_data_type = value
+
+            if upper == "NODE_COORD_SECTION" or upper == "DISPLAY_DATA_SECTION":
                 in_section = True
                 continue
-            if "EOF" in line or (in_section and line[0].isalpha()):
+            if upper == "EOF" or (in_section and line[0].isalpha()):
                 break
             if in_section:
                 parts = line.split()
                 if len(parts) >= 3:
                     coords.append([float(parts[1]), float(parts[2])])
-    return np.array(coords, dtype=np.float32)
 
-
-def to_device(data: Any, device: torch.device) -> Any:
-    skip = {"num_faces"}
-    for k in dir(data):
-        if k.startswith("_") or k in skip:
-            continue
-        v = getattr(data, k, None)
-        if isinstance(v, torch.Tensor):
-            try:
-                setattr(data, k, v.to(device))
-            except Exception:
-                pass
-    return data
-
+    coords_np = np.array(coords, dtype=np.float32)
+    if coords_np.ndim != 2 or coords_np.shape[0] == 0 or coords_np.shape[1] != 2:
+        raise ValueError(
+            f"TSPLIB instance has no usable 2D coordinates: {path} "
+            f"(EDGE_WEIGHT_TYPE={edge_weight_type}, DISPLAY_DATA_TYPE={display_data_type}). "
+            "Expected NODE_COORD_SECTION or DISPLAY_DATA_SECTION."
+        )
+    return coords_np
 
 def make_empty_metrics(setting: str) -> Dict[str, str]:
     return {field: "N/A" for field, _, _ in SETTING_COLUMNS[setting]}
-
-
-def log_progress(prefix: str, message: str) -> None:
-    print(f"{prefix} {message}", flush=True)
 
 
 def format_result_triplet(*, length: float, duration: float, teacher_len: float | None) -> Dict[str, str]:
@@ -188,7 +203,7 @@ def parse_instance_name_list(text: str | None) -> List[str]:
 
 
 def describe_instance_presets() -> str:
-    return "instance_presets=all,largest5,largest10,largest20,paper"
+    return "instance_presets=all,largest5,largest10,largest20,n100_500,small100_500,paper"
 
 
 def build_partial_run_tag(*, ckpt_path: str, selection_tag: str, r: int, selected_settings: List[str]) -> str:
@@ -260,6 +275,11 @@ def select_tsplib_files(
         selected = sorted(all_tsp_files, key=lambda x: x[0], reverse=True)[:largest_count]
         selected.sort(key=lambda x: (x[0], x[1].stem))
         return selected, f"preset {preset} -> top {len(selected)} largest instances", preset
+    if mode == "range":
+        min_n = int(preset_cfg["min_n"])
+        max_n = int(preset_cfg["max_n"])
+        selected = [item for item in all_tsp_files if min_n <= int(item[0]) <= max_n]
+        return selected, f"preset {preset} -> {min_n} <= N <= {max_n} ({len(selected)} instances)", preset
     if mode == "names":
         names = [normalize_tsplib_instance_name(name) for name in preset_cfg["names"]]
         missing = [name for name in names if name not in by_name]
@@ -446,6 +466,9 @@ def main(argv: List[str] | None = None):
     parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
     parser.add_argument("--skip_guided_lkh", action="store_true", help="legacy flag: remove guided_lkh from selected settings")
     parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
+    parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
+    parser.add_argument("--patching_mode", type=str, default="prune", choices=("prune", "arora"))
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
     parser.add_argument("--run_exact", action="store_true", help="legacy flag: add exact to selected settings")
@@ -488,34 +511,18 @@ def main(argv: List[str] | None = None):
     print(f"[env] device={device}")
 
     print(f"[ckpt] loading from {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    if "leaf_encoder" in ckpt and "emb_type.weight" in ckpt["leaf_encoder"]:
-        d_model = ckpt["leaf_encoder"]["emb_type.weight"].shape[1]
-    else:
-        d_model = 128
+    model_bundle = load_twopass_eval_models(
+        ckpt_path=args.ckpt,
+        device=device,
+        r=int(args.r),
+    )
+    d_model = model_bundle.d_model
+    state_mode = model_bundle.state_mode
+    matching_max_used = model_bundle.matching_max_used
+    leaf_encoder = model_bundle.leaf_encoder
+    merge_encoder = model_bundle.merge_encoder
+    decoder = model_bundle.decoder
     print(f"[model] detected d_model={d_model}")
-
-    ckpt_args = ckpt.get("args", {})
-    state_mode = str(ckpt_args.get("state_mode", "iface"))
-    matching_max_used = int(ckpt_args.get("matching_max_used", 4))
-    num_states = None
-    if state_mode == "matching":
-        num_states = infer_boundary_state_count(num_slots=4 * int(args.r), max_used=matching_max_used)
-
-    leaf_encoder = LeafEncoder(d_model=d_model).to(device)
-    merge_encoder = MergeEncoder(d_model=d_model).to(device)
-    decoder = TopDownDecoder(
-        d_model=d_model,
-        mode=ckpt_args.get("td_mode", "two_stage"),
-        state_mode=state_mode,
-        num_states=num_states,
-    ).to(device)
-    leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
-    merge_encoder.load_state_dict(ckpt["merge_encoder"])
-    decoder.load_state_dict(ckpt["decoder"])
-    leaf_encoder.eval()
-    merge_encoder.eval()
-    decoder.eval()
 
     pomo_model = None
     pomo_env = None
@@ -543,7 +550,10 @@ def main(argv: List[str] | None = None):
     )
     bu_runner = BottomUpTreeRunner()
     td_runner = TopDownTreeRunner()
-    spanner_builder = SpannerBuilder(mode="delaunay")
+    spanner_builder = build_spanner_builder(
+        spanner_mode=str(args.spanner_mode),
+        theta_k=int(args.theta_k),
+    )
     raw_builder = RawPyramidBuilder(max_points_per_leaf=4, max_depth=20)
 
     tsplib_path = Path(args.tsplib_dir)
@@ -566,6 +576,7 @@ def main(argv: List[str] | None = None):
             selected_settings=selected_settings,
         )
     fieldnames = build_result_fieldnames(selected_settings)
+    skipped_instances: List[Dict[str, Any]] = []
     save_metadata = {
         "run_tag": run_tag,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -573,11 +584,16 @@ def main(argv: List[str] | None = None):
         "tsplib_dir": str(Path(args.tsplib_dir).resolve()),
         "num_instances_requested": int(args.num_instances),
         "num_instances_selected": len(tsp_files),
+        "num_instances_skipped": 0,
+        "skipped_instances": skipped_instances,
         "instance_preset": args.instance_preset,
         "instances": parse_instance_name_list(args.instances),
         "selection_desc": selection_desc,
         "r": int(args.r),
         "device": str(device),
+        "spanner_mode": str(args.spanner_mode),
+        "theta_k": int(args.theta_k),
+        "patching_mode": str(args.patching_mode),
         "selected_settings": selected_settings,
         "state_mode": state_mode,
         "matching_max_used": matching_max_used,
@@ -612,27 +628,82 @@ def main(argv: List[str] | None = None):
 
         t_inst0 = time.time()
         log_progress(prefix, "parse TSPLIB coordinates...")
-        coords = parse_tsp_file(str(f_path))
-        points_t = torch.from_numpy(coords).float().unsqueeze(0)
-        log_progress(prefix, "build Delaunay spanner...")
-        t0 = time.time()
-        edge_index_sp, edge_attr_sp, _ = spanner_builder.build_batch(points_t, num_workers=args.num_workers)
-        log_progress(prefix, f"spanner done: E={edge_index_sp.shape[1]} in {time.time() - t0:.2f}s")
-        log_progress(prefix, "build raw pyramid...")
-        t0 = time.time()
-        raw_data = raw_builder.process_sample(points_t[0], edge_index_sp, edge_attr_sp)
+        try:
+            coords = parse_tsp_file(str(f_path))
+        except ValueError as exc:
+            skipped_instances.append(
+                {
+                    "instance_index": inst_idx,
+                    "instance": name,
+                    "n": int(n),
+                    "reason": str(exc),
+                }
+            )
+            save_metadata["num_instances_skipped"] = len(skipped_instances)
+            elapsed_sec = time.time() - t_inst0
+            completed_at_utc = datetime.now(timezone.utc).isoformat()
+            result_entry = {
+                "name": name,
+                "n": n,
+                "instance_index": inst_idx,
+                "elapsed_sec": round(elapsed_sec, 3),
+                "completed_at_utc": completed_at_utc,
+                "metrics": metrics,
+                "skipped_reason": str(exc),
+            }
+            all_results.append(result_entry)
+            append_partial_result(
+                paths=partial_paths,
+                fieldnames=fieldnames,
+                inst_idx=inst_idx,
+                name=name,
+                n=n,
+                elapsed_sec=elapsed_sec,
+                completed_at_utc=completed_at_utc,
+                selected_settings=selected_settings,
+                metrics=metrics,
+                metadata=save_metadata,
+                all_results=all_results,
+            )
+            log_progress(prefix, f"skip unsupported instance: {exc}")
+            print(build_table_row(name=name, n=n, selected_settings=selected_settings, metrics=metrics))
+            continue
+        points_cpu = torch.from_numpy(coords).float()
+        log_progress(
+            prefix,
+            f"preprocess hierarchy (spanner={args.spanner_mode}, patching={args.patching_mode}, r={args.r})...",
+        )
+        prep = preprocess_points_to_hierarchy(
+            points_cpu,
+            r=int(args.r),
+            num_workers=int(args.num_workers),
+            raw_builder=raw_builder,
+            spanner_builder=spanner_builder,
+            patching_mode=str(args.patching_mode),
+        )
+        raw_data = prep["raw_data"]
+        data = prep["data_cpu"]
+        shared_timing = prep["shared_timing"]
+        spanner_edge_index = prep["spanner_edge_index"]
+        log_progress(
+            prefix,
+            (
+                f"preprocess done: E={int(spanner_edge_index.shape[1])}, "
+                f"spanner={shared_timing['spanner_construction_sec']:.2f}s, "
+                f"quadtree={shared_timing['quadtree_building_sec']:.2f}s, "
+                f"patch={shared_timing['patching_sec']:.2f}s"
+            ),
+        )
         num_tree_nodes = int(getattr(raw_data, "num_tree_nodes", -1))
         num_interfaces = int(getattr(raw_data, "interface_assign_index", torch.empty((2, 0))).shape[1])
         num_crossings = int(getattr(raw_data, "crossing_assign_index", torch.empty((2, 0))).shape[1])
         log_progress(
             prefix,
-            f"raw pyramid done: nodes={num_tree_nodes}, interfaces={num_interfaces}, crossings={num_crossings} in {time.time() - t0:.2f}s",
+            f"hierarchy stats: nodes={num_tree_nodes}, interfaces={num_interfaces}, crossings={num_crossings}",
         )
-        log_progress(prefix, f"apply r-light pruning (r={args.r})...")
-        t0 = time.time()
-        data = prune_r_light_single(raw_data, r=args.r)
         alive_edges = int(getattr(data, "edge_alive_mask", torch.empty((0,), dtype=torch.bool)).sum().item()) if hasattr(data, "edge_alive_mask") else -1
-        log_progress(prefix, f"pruning done: alive_edges={alive_edges} in {time.time() - t0:.2f}s")
+        if alive_edges >= 0:
+            log_progress(prefix, f"effective alive edges={alive_edges}")
         log_progress(prefix, "move tensors to device...")
         data_cuda = to_device(data, device)
 
@@ -703,6 +774,30 @@ def main(argv: List[str] | None = None):
                     teacher_len=teacher_len,
                 )
             log_progress(prefix, f"exact done in {exact_res.duration:.2f}s (feasible={exact_res.feasible})")
+
+        if "spanner_uniform_lkh" in selected_settings:
+            log_progress(prefix, "start spanner-only LKH...")
+            spanner_lkh_task = {
+                "pos": data_cuda.pos.cpu(),
+                "mode": "spanner_uniform",
+                "edge_index": select_effective_edge_index(data_cuda),
+                "teacher_len": teacher_len if teacher_len else 0.0,
+            }
+            spanner_res, _ = solve_with_lkh_parallel(
+                [spanner_lkh_task],
+                lkh_executable=args.lkh_exe,
+                num_workers=args.num_workers,
+            )[0]
+            if spanner_res.feasible:
+                metrics["spanner_uniform_lkh"] = format_result_triplet(
+                    length=spanner_res.length,
+                    duration=spanner_res.duration,
+                    teacher_len=teacher_len,
+                )
+            log_progress(
+                prefix,
+                f"spanner-only LKH done in {spanner_res.duration:.2f}s (feasible={spanner_res.feasible})",
+            )
 
         if "guided_lkh" in selected_settings:
             log_progress(prefix, "start guided LKH...")

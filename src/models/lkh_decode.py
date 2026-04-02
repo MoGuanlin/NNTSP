@@ -43,8 +43,72 @@ class LKHDecodeResult:
     order: List[int]
     length: float
     feasible: bool
-    mode: str  # 'pure' or 'guided'
+    mode: str  # 'pure', 'guided', or 'spanner_uniform'
     duration: float  # execution time in seconds
+
+
+def build_guided_candidates(
+    *,
+    num_nodes: int,
+    edge_index: Tensor,
+    edge_logit: Tensor,
+    logit_scale: float,
+    top_k: int,
+) -> List[List[Tuple[int, int]]]:
+    """Build Top-K per-node LKH candidates from predicted edge logits."""
+    candidates: List[List[Tuple[int, int]]] = [[] for _ in range(int(num_nodes))]
+    if edge_logit is None or edge_index is None:
+        return candidates
+
+    logits_np = edge_logit.detach().cpu().numpy()
+    valid_mask = logits_np > -1e8
+    if not np.any(valid_mask):
+        return candidates
+
+    u = edge_index[0].detach().cpu().numpy()
+    v = edge_index[1].detach().cpu().numpy()
+    max_v = np.max(logits_np[valid_mask])
+
+    for i in range(len(logits_np)):
+        if not valid_mask[i]:
+            continue
+        alpha = int(round(float(logit_scale) * (float(max_v) - float(logits_np[i]))))
+        a = int(u[i])
+        b = int(v[i])
+        candidates[a].append((b, alpha))
+        candidates[b].append((a, alpha))
+
+    final_candidates: List[List[Tuple[int, int]]] = []
+    for row in candidates:
+        row_sorted = sorted(row, key=lambda x: (x[1], x[0]))
+        final_candidates.append(row_sorted[: int(top_k)])
+    return final_candidates
+
+
+def build_uniform_spanner_candidates(
+    *,
+    num_nodes: int,
+    edge_index: Tensor,
+    uniform_alpha: int = 0,
+) -> List[List[Tuple[int, int]]]:
+    """Build all spanner candidates with a uniform alpha value."""
+    candidates: List[List[Tuple[int, int]]] = [[] for _ in range(int(num_nodes))]
+    if edge_index is None:
+        return candidates
+
+    u = edge_index[0].detach().cpu().numpy()
+    v = edge_index[1].detach().cpu().numpy()
+    alpha = int(uniform_alpha)
+
+    for i in range(int(edge_index.shape[1])):
+        a = int(u[i])
+        b = int(v[i])
+        if a == b:
+            continue
+        candidates[a].append((b, alpha))
+        candidates[b].append((a, alpha))
+
+    return [sorted(row, key=lambda x: (x[0], x[1])) for row in candidates]
 
 class LKHDecodingDataset(torch.utils.data.Dataset):
     """Dataset wrapper for parallel LKH decoding via DataLoader."""
@@ -62,8 +126,8 @@ class LKHDecodingDataset(torch.utils.data.Dataset):
         """
         tasks: List of dicts containing:
             - pos: [N, 2]
-            - mode: 'pure' or 'guided'
-            - edge_index: [2, E] (for guided)
+            - mode: 'pure', 'guided', or 'spanner_uniform'
+            - edge_index: [2, E] (for guided / spanner_uniform)
             - edge_logit: [E] (for guided)
             - teacher_len: float
             - initial_tour: List[int] (optional, for warm start)
@@ -119,44 +183,11 @@ class LKHDecodingDataset(torch.utils.data.Dataset):
         
         return matrix
 
-    def _logits_to_candidates(self, N: int, edge_index: Tensor, edge_logit: Tensor) -> List[List[Tuple[int, int]]]:
-        """Pick Top-K edges per node based on NN logits to serve as LKH candidates."""
-        adj = [[] for _ in range(N)]
-        if edge_logit is None or edge_index is None:
-            return adj
-
-        logits_np = edge_logit.detach().cpu().numpy()
-        u = edge_index[0].detach().cpu().numpy()
-        v = edge_index[1].detach().cpu().numpy()
-
-        valid_mask = logits_np > -1e8
-        if not np.any(valid_mask):
-            return adj
-            
-        max_v = np.max(logits_np[valid_mask])
-
-        for i in range(len(logits_np)):
-            if not valid_mask[i]:
-                continue
-            # Alpha = Scale * (MaxLogit - Logit)
-            alpha = int(round(self.logit_scale * (max_v - logits_np[i])))
-            adj[u[i]].append((int(v[i]), alpha))
-            adj[v[i]].append((int(u[i]), alpha))
-        
-        # Keep only Top-K for each node
-        final_candidates = []
-        for i in range(N):
-            # Sort by alpha (lower is better/higher logit)
-            node_cands = sorted(adj[i], key=lambda x: x[1])
-            final_candidates.append(node_cands[:self.top_k])
-            
-        return final_candidates
-
     def __getitem__(self, idx: int) -> Tuple[LKHDecodeResult, float]:
         task = self.tasks[idx]
         pos = task['pos']
         pos_np = pos.detach().cpu().numpy()
-        mode = task['mode']
+        mode = str(task['mode']).lower()
         N = pos.shape[0]
         
         # Create temp environment
@@ -178,23 +209,47 @@ class LKHDecodingDataset(torch.utils.data.Dataset):
             m_cand = None
             m_trials = None
 
+            initial_tour = task.get('initial_tour')
+
             if mode == 'guided':
                 # Use fewer candidates for guided mode to emphasize NN-guidance speed
-                candidates = self._logits_to_candidates(N, task.get('edge_index'), task.get('edge_logit'))
-                write_candidate_file(cand_path, N, list(candidates)) # candidates is already a list of lists
+                candidates = build_guided_candidates(
+                    num_nodes=N,
+                    edge_index=task.get('edge_index'),
+                    edge_logit=task.get('edge_logit'),
+                    logit_scale=self.logit_scale,
+                    top_k=self.top_k,
+                )
+                write_candidate_file(cand_path, N, list(candidates))
                 cand_p = cand_path
-                
-                # Warm start with initial tour
-                initial_tour = task.get('initial_tour')
                 if initial_tour is not None:
                     write_tour_file(init_tour_path, initial_tour)
                     init_p = init_tour_path
-                
+
                 # Guidance is strong, we can skip subgradient optimization
                 subgrad = False
                 # Restrict LKH search space to our NN candidates for speed
-                m_cand = 5 
+                m_cand = 5
                 m_trials = 1
+            elif mode == 'spanner_uniform':
+                candidates = build_uniform_spanner_candidates(
+                    num_nodes=N,
+                    edge_index=task.get('edge_index'),
+                    uniform_alpha=int(task.get('uniform_alpha', 0)),
+                )
+                write_candidate_file(cand_path, N, list(candidates))
+                cand_p = cand_path
+                if initial_tour is not None:
+                    write_tour_file(init_tour_path, initial_tour)
+                    init_p = init_tour_path
+
+                # This baseline keeps only spanner candidates but provides no
+                # learned ranking inside them.
+                subgrad = False
+                m_cand = 0
+                m_trials = 1
+            elif mode != 'pure':
+                raise ValueError(f"Unsupported LKH decode mode: {mode}")
             
             write_par(par_path, tsp_path, tour_path, runs=self.num_runs, seed=self.seed, 
                       precision=1, candidate_path=cand_p, initial_tour_path=init_p, 

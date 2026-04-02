@@ -24,14 +24,15 @@ or replace any existing 2-pass training code.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import torch
 from torch import Tensor
 
 from .bc_state_catalog import BoundaryStateCatalog
-from .merge_decoder import MergeDecoder, ParentMemory
+from .merge_decoder import MergeDecoder
 from .node_token_packer import PackedBatch, PackedLeafPoints, PackedNodeTokens
+from .shared_tree import extract_z, gather_node_fields
 
 
 # ─── Output ──────────────────────────────────────────────────────────────────
@@ -47,17 +48,6 @@ class OnePassTrainResult:
     z: Tensor
     child_scores: Tensor
     decode_mask: Tensor
-
-
-# ─── Helper ──────────────────────────────────────────────────────────────────
-
-def _extract_z(out):
-    if torch.is_tensor(out):
-        return out
-    if isinstance(out, tuple) and len(out) >= 1 and torch.is_tensor(out[0]):
-        return out[0]
-    raise TypeError("Encoder output must be Tensor or (Tensor, dict).")
-
 
 # ─── Main Runner ─────────────────────────────────────────────────────────────
 
@@ -189,11 +179,11 @@ class OnePassTrainRunner:
             # ── Leaves: encode ────────────────────────────────────────
             if leaf_nids.numel() > 0:
                 rows = leaf_row_for_node[leaf_nids]
-                leaf_inputs = self._gather_node_fields(tokens, leaf_nids)
+                leaf_inputs = gather_node_fields(tokens, leaf_nids)
                 leaf_inputs["leaf_points_xy"] = leaves.point_xy[rows]
                 leaf_inputs["leaf_points_mask"] = leaves.point_mask[rows]
 
-                z_leaf = _extract_z(leaf_encoder(**leaf_inputs))
+                z_leaf = extract_z(leaf_encoder(**leaf_inputs))[0]
 
                 if z is None:
                     z = torch.zeros(total_M, z_leaf.shape[1], dtype=z_leaf.dtype, device=device)
@@ -216,11 +206,11 @@ class OnePassTrainRunner:
                 child_z_batch = z[ch_clamped]
                 child_z_batch = child_z_batch * child_mask_batch.unsqueeze(-1).float()
 
-                merge_inputs = self._gather_node_fields(tokens, internal_nids)
+                merge_inputs = gather_node_fields(tokens, internal_nids)
                 merge_inputs["child_z"] = child_z_batch
                 merge_inputs["child_mask"] = child_mask_batch
 
-                z_parent = _extract_z(merge_encoder(**merge_inputs))
+                z_parent = extract_z(merge_encoder(**merge_inputs))[0]
                 z = z.index_copy(0, internal_nids, z_parent)
                 computed[internal_nids] = True
 
@@ -297,24 +287,6 @@ class OnePassTrainRunner:
             child_scores=child_scores,
             decode_mask=decode_mask,
         )
-
-    @staticmethod
-    def _gather_node_fields(tokens: PackedNodeTokens, nids: Tensor) -> Dict[str, Tensor]:
-        return {
-            "node_feat_rel": tokens.tree_node_feat_rel[nids],
-            "node_depth": tokens.tree_node_depth[nids],
-            "iface_feat6": tokens.iface_feat6[nids],
-            "iface_mask": tokens.iface_mask[nids],
-            "iface_boundary_dir": tokens.iface_boundary_dir[nids],
-            "iface_inside_endpoint": tokens.iface_inside_endpoint[nids],
-            "iface_inside_quadrant": tokens.iface_inside_quadrant[nids],
-            "cross_feat6": tokens.cross_feat6[nids],
-            "cross_mask": tokens.cross_mask[nids],
-            "cross_child_pair": tokens.cross_child_pair[nids],
-            "cross_is_leaf_internal": tokens.cross_is_leaf_internal[nids],
-        }
-
-
 # ─── Loss helper ─────────────────────────────────────────────────────────────
 
 def onepass_loss(

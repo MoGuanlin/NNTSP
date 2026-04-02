@@ -96,6 +96,8 @@ def decode_tour_from_edge_logits(
     edge_logit: Tensor,           # [E] local, logits/scores (higher=better)
     prefer_spanner_only: bool = True,
     allow_off_spanner_patch: bool = True,
+    refine_max_n: Optional[int] = None,
+    fallback_max_n: Optional[int] = None,
 ) -> TourDecodeResult:
     """
     Decode a Hamiltonian cycle from edge logits.
@@ -270,6 +272,18 @@ def decode_tour_from_edge_logits(
     order = _extract_cycle_order(adj, start=0) if feasible else None
 
     if order is None:
+        if fallback_max_n is not None and int(fallback_max_n) >= 0 and N > int(fallback_max_n):
+            return TourDecodeResult(
+                order=[],
+                length=float("inf"),
+                feasible=False,
+                num_off_spanner_edges=int(num_off_spanner_patching),
+                num_edges_broken=int(num_edges_broken),
+                num_components_initial=int(num_components_initial),
+                fallback_used=False,
+                num_patching_steps=int(num_patching_steps),
+                duration=time.time() - start_t,
+            )
         # fallback: use existing torch-vectorized heuristic (NN + 2-opt)
         from src.models.tour_solver import solve_tsp_heuristic
         tour_h = solve_tsp_heuristic(pos, start=0, max_2opt_passes=50)
@@ -278,73 +292,82 @@ def decode_tour_from_edge_logits(
         feasible = False
         fallback_used = True
     else:
-        # OPTIONAL: Candidate-restricted 2-opt refinement
-        from src.models.tour_solver import pairwise_dist
-        D_full = pairwise_dist(pos).detach().cpu().numpy()
-        N = D_full.shape[0]
-        
-        # Candidate-restricted 2-opt (Fast O(KN))
-        # Increase K for better quality. For large N, we cap this to preserve speed.
-        K = 40 if N < 1000 else 20
-        _, topk_indices = torch.topk(torch.from_numpy(D_full), k=min(K+1, N), dim=1, largest=False)
-        top_indices = topk_indices[:, 1:].numpy().tolist() # remove self
-        
-        curr_order = list(order)
-        pos_in_tour = [0] * N
-        for idx, node in enumerate(curr_order):
-            pos_in_tour[node] = idx
-            
-        improved = True
-        passes = 0
-        max_passes = 100 if N < 1000 else 30
-        while improved and passes < max_passes:
-            improved = False
-            passes += 1
-            for i in range(N):
-                u = curr_order[i]
-                v_idx = (i + 1) % N
-                v = curr_order[v_idx]
-                d_uv = D_full[u][v]
-                
-                # Cache top_indices[u] and other local variables
-                u_nbors = top_indices[u]
-                for w in u_nbors:
-                    if w == u or w == v: continue
-                    
-                    idx_w = pos_in_tour[w]
-                    idx_x = (idx_w + 1) % N
-                    x = curr_order[idx_x]
-                    if x == u or x == v: continue
-                    
-                    # Cost of current edges: (u,v) and (w,x)
-                    # Cost of potential edges: (u,w) and (v,x)
-                    if d_uv + D_full[w][x] > D_full[u][w] + D_full[v][x] + 1e-9:
-                        # Perform swap: reverse internal segment
-                        if i < idx_w:
-                            # [A, u][v, ..., w][x, C] -> reverse v...w
-                            # In slice notation: i+1 to idx_w+1
-                            start, end = i + 1, idx_w + 1
-                            curr_order[start:end] = curr_order[start:end][::-1]
-                            for k in range(start, end):
-                                pos_in_tour[curr_order[k]] = k
-                        else:
-                            # [A, x][w, ..., u][v, C] -> reverse x...u
-                            # In slice notation: idx_x to i+1
-                            start, end = idx_x, i + 1
-                            curr_order[start:end] = curr_order[start:end][::-1]
-                            for k in range(start, end):
-                                pos_in_tour[curr_order[k]] = k
-                        
-                        # Update current dist and node for next candidate check
-                        v = w
-                        d_uv = D_full[u][v]
-                        improved = True
-        
-        order = curr_order
-        # final length
-        length = 0.0
-        for idx in range(N):
-            length += D_full[curr_order[idx]][curr_order[(idx+1)%N]]
+        do_refine = True
+        if refine_max_n is not None and int(refine_max_n) >= 0 and N > int(refine_max_n):
+            do_refine = False
+
+        if not do_refine:
+            length = _tour_length(pos, order)
+        else:
+            # OPTIONAL: Candidate-restricted 2-opt refinement
+            from src.models.tour_solver import pairwise_dist
+            D_full = pairwise_dist(pos).detach().cpu().numpy()
+            N = D_full.shape[0]
+
+            # Candidate-restricted 2-opt (Fast O(KN))
+            # Increase K for better quality. For large N, we cap this to preserve speed.
+            K = 40 if N < 1000 else 20
+            _, topk_indices = torch.topk(torch.from_numpy(D_full), k=min(K + 1, N), dim=1, largest=False)
+            top_indices = topk_indices[:, 1:].numpy().tolist()  # remove self
+
+            curr_order = list(order)
+            pos_in_tour = [0] * N
+            for idx, node in enumerate(curr_order):
+                pos_in_tour[node] = idx
+
+            improved = True
+            passes = 0
+            max_passes = 100 if N < 1000 else 30
+            while improved and passes < max_passes:
+                improved = False
+                passes += 1
+                for i in range(N):
+                    u = curr_order[i]
+                    v_idx = (i + 1) % N
+                    v = curr_order[v_idx]
+                    d_uv = D_full[u][v]
+
+                    # Cache top_indices[u] and other local variables
+                    u_nbors = top_indices[u]
+                    for w in u_nbors:
+                        if w == u or w == v:
+                            continue
+
+                        idx_w = pos_in_tour[w]
+                        idx_x = (idx_w + 1) % N
+                        x = curr_order[idx_x]
+                        if x == u or x == v:
+                            continue
+
+                        # Cost of current edges: (u,v) and (w,x)
+                        # Cost of potential edges: (u,w) and (v,x)
+                        if d_uv + D_full[w][x] > D_full[u][w] + D_full[v][x] + 1e-9:
+                            # Perform swap: reverse internal segment
+                            if i < idx_w:
+                                # [A, u][v, ..., w][x, C] -> reverse v...w
+                                # In slice notation: i+1 to idx_w+1
+                                start, end = i + 1, idx_w + 1
+                                curr_order[start:end] = curr_order[start:end][::-1]
+                                for k in range(start, end):
+                                    pos_in_tour[curr_order[k]] = k
+                            else:
+                                # [A, x][w, ..., u][v, C] -> reverse x...u
+                                # In slice notation: idx_x to i+1
+                                start, end = idx_x, i + 1
+                                curr_order[start:end] = curr_order[start:end][::-1]
+                                for k in range(start, end):
+                                    pos_in_tour[curr_order[k]] = k
+
+                            # Update current dist and node for next candidate check
+                            v = w
+                            d_uv = D_full[u][v]
+                            improved = True
+
+            order = curr_order
+            # final length
+            length = 0.0
+            for idx in range(N):
+                length += D_full[curr_order[idx]][curr_order[(idx + 1) % N]]
 
     return TourDecodeResult(
         order=order,
@@ -358,32 +381,4 @@ def decode_tour_from_edge_logits(
         duration=time.time() - start_t
     )
 
-
-
-class DecodingDataset(torch.utils.data.Dataset):
-    """Dataset wrapper for parallel CPU decoding via DataLoader."""
-
-    def __init__(self, tasks: List[Tuple[Tensor, Tensor, Tensor, bool, bool, float]]) -> None:
-        """
-        Args:
-            tasks: List of (pos, spanner_edge_index, edge_logit, prefer_spanner_only, allow_off_spanner_patch, teacher_len)
-                   All tensors must be on CPU.
-        """
-        self.tasks = tasks
-
-    def __len__(self) -> int:
-        return len(self.tasks)
-
-    def __getitem__(self, idx: int) -> Tuple[TourDecodeResult, float]:
-        pos, spanner_edge_index, edge_logit, prefer_spanner, allow_patch, tlen = self.tasks[idx]
-        res = decode_tour_from_edge_logits(
-            pos=pos,
-            spanner_edge_index=spanner_edge_index,
-            edge_logit=edge_logit,
-            prefer_spanner_only=prefer_spanner,
-            allow_off_spanner_patch=allow_patch,
-        )
-        return res, tlen
-
-
-__all__ = ["decode_tour_from_edge_logits", "TourDecodeResult", "DecodingDataset"]
+__all__ = ["decode_tour_from_edge_logits", "TourDecodeResult"]

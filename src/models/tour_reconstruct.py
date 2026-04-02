@@ -31,17 +31,17 @@ from .dp_core import (
     leaf_solve_state,
 )
 from .dp_runner import CostTableEntry, OnePassDPResult
-from .edge_aggregation import EdgeScores, aggregate_logits_to_edges
 from .node_token_packer import PackedLeafPoints, PackedNodeTokens
-
-
-# Hard logit values for discrete activations
-_LOGIT_ON = 10.0
-_LOGIT_OFF = -10.0
+from .shared_tree import build_leaf_row_for_node
+from .tour_reconstruct_legacy import dp_result_to_edge_scores, dp_result_to_logits
 
 
 class _ReconstructionError(RuntimeError):
     """Raised when traceback-selected states cannot be turned into a legal tour."""
+
+    def __init__(self, message: str, *, details: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.details: Dict[str, Any] = dict(details) if details is not None else {}
 
 
 @dataclass
@@ -183,14 +183,6 @@ def _to_cpu_catalog(catalog: BoundaryStateCatalog) -> BoundaryStateCatalog:
         max_used=int(catalog.max_used),
     )
 
-
-def _build_leaf_row_for_node(total_m: int, leaf_node_id: Tensor) -> Tensor:
-    leaf_row_for_node = torch.full((total_m,), -1, dtype=torch.long)
-    if leaf_node_id.numel() > 0:
-        leaf_row_for_node[leaf_node_id] = torch.arange(leaf_node_id.numel(), dtype=torch.long)
-    return leaf_row_for_node
-
-
 def _root_scale(tokens: PackedNodeTokens | SimpleNamespace) -> float:
     if hasattr(tokens, "root_scale_s") and torch.is_tensor(tokens.root_scale_s) and tokens.root_scale_s.numel() > 0:
         return float(tokens.root_scale_s[0].item())
@@ -289,7 +281,15 @@ def _validate_nonroot_witness(
     catalog: BoundaryStateCatalog,
 ) -> None:
     if witness.closed_cycles:
-        raise _ReconstructionError(f"node {nid} reconstructed an internal closed cycle")
+        raise _ReconstructionError(
+            f"node {nid} reconstructed an internal closed cycle",
+            details={
+                "reason": "internal_closed_cycle",
+                "node_id": int(nid),
+                "sigma_idx": int(sigma_idx),
+                "node_depth": int(tokens.tree_node_depth[nid].item()),
+            },
+        )
 
     used = catalog.used_iface[sigma_idx]
     mate = catalog.mate[sigma_idx]
@@ -304,15 +304,57 @@ def _validate_nonroot_witness(
         actual_counts[frag.start_slot] = actual_counts.get(frag.start_slot, 0) + 1
         actual_counts[frag.end_slot] = actual_counts.get(frag.end_slot, 0) + 1
         if int(mate[frag.start_slot].item()) != frag.end_slot:
-            raise _ReconstructionError(f"node {nid} start-slot pairing does not match catalog state")
+            raise _ReconstructionError(
+                f"node {nid} start-slot pairing does not match catalog state",
+                details={
+                    "reason": "start_slot_pairing_mismatch",
+                    "node_id": int(nid),
+                    "sigma_idx": int(sigma_idx),
+                    "node_depth": int(tokens.tree_node_depth[nid].item()),
+                    "fragment_start_slot": int(frag.start_slot),
+                    "fragment_end_slot": int(frag.end_slot),
+                    "catalog_mate": int(mate[frag.start_slot].item()),
+                },
+            )
         if int(mate[frag.end_slot].item()) != frag.start_slot:
-            raise _ReconstructionError(f"node {nid} end-slot pairing does not match catalog state")
+            raise _ReconstructionError(
+                f"node {nid} end-slot pairing does not match catalog state",
+                details={
+                    "reason": "end_slot_pairing_mismatch",
+                    "node_id": int(nid),
+                    "sigma_idx": int(sigma_idx),
+                    "node_depth": int(tokens.tree_node_depth[nid].item()),
+                    "fragment_start_slot": int(frag.start_slot),
+                    "fragment_end_slot": int(frag.end_slot),
+                    "catalog_mate": int(mate[frag.end_slot].item()),
+                },
+            )
 
     if set(actual_counts.keys()) != expected_active:
-        raise _ReconstructionError(f"node {nid} exposed boundary slots do not match traceback state")
+        raise _ReconstructionError(
+            f"node {nid} exposed boundary slots do not match traceback state",
+            details={
+                "reason": "boundary_slots_do_not_match_traceback_state",
+                "node_id": int(nid),
+                "sigma_idx": int(sigma_idx),
+                "node_depth": int(tokens.tree_node_depth[nid].item()),
+                "expected_active_slots": sorted(int(s) for s in expected_active),
+                "actual_slot_counts": {str(int(k)): int(v) for k, v in actual_counts.items()},
+            },
+        )
     for slot, count in actual_counts.items():
         if count != 1:
-            raise _ReconstructionError(f"node {nid} boundary slot {slot} appears {count} times")
+            raise _ReconstructionError(
+                f"node {nid} boundary slot {slot} appears {count} times",
+                details={
+                    "reason": "boundary_slot_multiplicity",
+                    "node_id": int(nid),
+                    "sigma_idx": int(sigma_idx),
+                    "node_depth": int(tokens.tree_node_depth[nid].item()),
+                    "slot": int(slot),
+                    "count": int(count),
+                },
+            )
 
 
 def _reconstruct_leaf_node(
@@ -461,7 +503,17 @@ def _reconstruct_node_witness(
             has_b = assembly.has_endpoint(tag_b)
             if has_a != has_b:
                 raise _ReconstructionError(
-                    f"node {nid} has unmatched glue endpoint between {(q, s)} and {(peer_q, peer_s)}"
+                    f"node {nid} has unmatched glue endpoint between {(q, s)} and {(peer_q, peer_s)}",
+                    details={
+                        "reason": "unmatched_glue_endpoint",
+                        "node_id": int(nid),
+                        "sigma_idx": int(sigma_idx),
+                        "node_depth": int(tokens.tree_node_depth[nid].item()),
+                        "child_global_ids": [int(x) for x in children.tolist()],
+                        "child_states": [int(x) for x in child_states],
+                        "glue_tag_a": {"child": int(q), "slot": int(s), "present": bool(has_a)},
+                        "glue_tag_b": {"child": int(peer_q), "slot": int(peer_s), "present": bool(has_b)},
+                    },
                 )
             if has_a and has_b:
                 assembly.glue(tag_a, tag_b)
@@ -480,7 +532,47 @@ def _reconstruct_node_witness(
         start_key = frag.start_tag
         end_key = frag.end_tag
         if start_key not in child_to_parent or end_key not in child_to_parent:
-            raise _ReconstructionError(f"node {nid} has an open fragment that does not map to the parent boundary")
+            open_fragments = []
+            for frag_idx, rem_frag in enumerate(assembly.fragments.values()):
+                open_fragments.append(
+                    {
+                        "fragment_idx": int(frag_idx),
+                        "num_points": int(len(rem_frag.points)),
+                        "start_child": int(rem_frag.start_tag[0]),
+                        "start_slot": int(rem_frag.start_tag[1]),
+                        "end_child": int(rem_frag.end_tag[0]),
+                        "end_slot": int(rem_frag.end_tag[1]),
+                        "start_maps_to_parent": rem_frag.start_tag in child_to_parent,
+                        "end_maps_to_parent": rem_frag.end_tag in child_to_parent,
+                    }
+                )
+            raise _ReconstructionError(
+                f"node {nid} has an open fragment that does not map to the parent boundary",
+                details={
+                    "reason": "open_fragment_not_mapped_to_parent_boundary",
+                    "node_id": int(nid),
+                    "sigma_idx": int(sigma_idx),
+                    "node_depth": int(tokens.tree_node_depth[nid].item()),
+                    "child_global_ids": [int(x) for x in children.tolist()],
+                    "child_states": [int(x) for x in child_states],
+                    "parent_boundary_slots": sorted(int(p) for p in child_to_parent.values()),
+                    "child_to_parent": [
+                        {
+                            "child": int(cq),
+                            "child_slot": int(cs),
+                            "parent_slot": int(p),
+                        }
+                        for (cq, cs), p in sorted(child_to_parent.items())
+                    ],
+                    "open_fragments": open_fragments,
+                    "offending_fragment": {
+                        "start_child": int(start_key[0]),
+                        "start_slot": int(start_key[1]),
+                        "end_child": int(end_key[0]),
+                        "end_slot": int(end_key[1]),
+                    },
+                },
+            )
         node_witness.open_fragments.append(
             _OpenFragment(
                 points=frag.points[:],
@@ -531,7 +623,7 @@ def reconstruct_tour_direct(
 
     root_id = int(cpu_tokens.root_id[0].item())
     total_m = int(cpu_tokens.is_leaf.shape[0])
-    leaf_row_for_node = _build_leaf_row_for_node(total_m, cpu_leaves.leaf_node_id)
+    leaf_row_for_node = build_leaf_row_for_node(total_m, cpu_leaves.leaf_node_id)
     point_pos = _build_point_position_map(
         tokens=cpu_tokens,
         leaves=cpu_leaves,
@@ -586,174 +678,16 @@ def reconstruct_tour_direct(
             stats=stats,
         )
     except _ReconstructionError as exc:
+        stats: Dict[str, Any] = {"error": str(exc), "num_points": float(num_points)}
+        if getattr(exc, "details", None):
+            stats["error_details"] = exc.details
         return DirectTourResult(
             order=[],
             length=float("inf"),
             feasible=False,
             num_points=num_points,
-            stats={"error": str(exc), "num_points": float(num_points)},
+            stats=stats,
         )
-
-
-def dp_result_to_logits(
-    *,
-    result: OnePassDPResult,
-    tokens: PackedNodeTokens,
-    catalog: BoundaryStateCatalog,
-) -> Tuple[Tensor, Tensor]:
-    """Convert DP result to per-node iface/cross logits."""
-    m = int(tokens.iface_mask.shape[0])
-    ti = int(tokens.iface_mask.shape[1])
-    tc = int(tokens.cross_mask.shape[1])
-    device = tokens.iface_mask.device
-
-    iface_logit = torch.full((m, ti), _LOGIT_OFF, dtype=torch.float32, device=device)
-    cross_logit = torch.full((m, tc), _LOGIT_OFF, dtype=torch.float32, device=device)
-
-    node_states: Dict[int, int] = {}
-    node_states.update(result.leaf_states)
-
-    root_id = int(tokens.root_id[0].item())
-    if result.root_sigma >= 0:
-        _collect_internal_states(
-            root_id=root_id,
-            root_sigma=result.root_sigma,
-            tokens=tokens,
-            cost_tables=result.cost_tables,
-            node_states=node_states,
-        )
-
-    for nid, si in node_states.items():
-        if si < 0:
-            continue
-        a = catalog.used_iface[si]
-        mask = tokens.iface_mask[nid].bool()
-        for slot in range(ti):
-            if not mask[slot].item():
-                continue
-            if a[slot].item():
-                iface_logit[nid, slot] = _LOGIT_ON
-
-    for nid, si in node_states.items():
-        if tokens.is_leaf[nid].item():
-            continue
-        if si < 0:
-            continue
-
-        children = tokens.tree_children_index[nid].long()
-        child_exists = children >= 0
-        ch_clamped = children.clamp_min(0)
-
-        build_correspondence_maps(
-            parent_iface_eid=tokens.iface_eid[nid],
-            parent_iface_mask=tokens.iface_mask[nid].bool(),
-            parent_iface_bdir=tokens.iface_boundary_dir[nid],
-            parent_cross_eid=tokens.cross_eid[nid],
-            parent_cross_mask=tokens.cross_mask[nid].bool(),
-            parent_cross_child_pair=tokens.cross_child_pair[nid],
-            children_iface_eid=tokens.iface_eid[ch_clamped],
-            children_iface_mask=tokens.iface_mask[ch_clamped].bool(),
-            children_iface_bdir=tokens.iface_boundary_dir[ch_clamped],
-            child_exists=child_exists,
-        )
-
-        for t in range(tc):
-            if not tokens.cross_mask[nid, t].bool().item():
-                continue
-            cross_eid = int(tokens.cross_eid[nid, t].item())
-            if cross_eid < 0:
-                continue
-
-            qi = int(tokens.cross_child_pair[nid, t, 0].item())
-            qj = int(tokens.cross_child_pair[nid, t, 1].item())
-            if qi < 0 or qj < 0:
-                continue
-            if not child_exists[qi].item() or not child_exists[qj].item():
-                continue
-
-            cid_i = int(children[qi].item())
-            cid_j = int(children[qj].item())
-
-            si_i = node_states.get(cid_i, -1)
-            si_j = node_states.get(cid_j, -1)
-            if si_i < 0 or si_j < 0:
-                continue
-
-            active_i = False
-            for s in range(ti):
-                if (tokens.iface_eid[cid_i, s].item() == cross_eid
-                        and tokens.iface_mask[cid_i, s].bool().item()):
-                    active_i = bool(catalog.used_iface[si_i, s].item())
-                    break
-
-            active_j = False
-            for s in range(ti):
-                if (tokens.iface_eid[cid_j, s].item() == cross_eid
-                        and tokens.iface_mask[cid_j, s].bool().item()):
-                    active_j = bool(catalog.used_iface[si_j, s].item())
-                    break
-
-            if active_i and active_j:
-                cross_logit[nid, t] = _LOGIT_ON
-
-    return iface_logit, cross_logit
-
-
-def _collect_internal_states(
-    *,
-    root_id: int,
-    root_sigma: int,
-    tokens: PackedNodeTokens,
-    cost_tables: Dict[int, CostTableEntry],
-    node_states: Dict[int, int],
-) -> None:
-    """Traverse backpointers to collect states at all internal nodes."""
-    queue = [(root_id, root_sigma)]
-    while queue:
-        nid, sigma_idx = queue.pop()
-        node_states[nid] = sigma_idx
-
-        if tokens.is_leaf[nid].item():
-            continue
-
-        ct = cost_tables.get(nid)
-        if ct is None:
-            continue
-        child_indices = ct.backptr.get(sigma_idx)
-        if child_indices is None:
-            continue
-
-        children = tokens.tree_children_index[nid].long()
-        for q in range(4):
-            cid = int(children[q].item())
-            if cid < 0:
-                continue
-            c_si = child_indices[q]
-            if c_si < 0:
-                continue
-            queue.append((cid, c_si))
-
-
-def dp_result_to_edge_scores(
-    *,
-    result: OnePassDPResult,
-    tokens: PackedNodeTokens,
-    catalog: BoundaryStateCatalog,
-    num_edges: Optional[int] = None,
-) -> EdgeScores:
-    """Convert DP result to spanner edge scores for legacy post-decoding baselines."""
-    iface_logit, cross_logit = dp_result_to_logits(
-        result=result, tokens=tokens, catalog=catalog,
-    )
-
-    return aggregate_logits_to_edges(
-        tokens=tokens,
-        cross_logit=cross_logit,
-        iface_logit=iface_logit,
-        reduce="amax",
-        num_edges=num_edges,
-    )
-
 
 __all__ = [
     "DirectTourResult",
