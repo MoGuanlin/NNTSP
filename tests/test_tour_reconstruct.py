@@ -1,7 +1,7 @@
 # tests/test_tour_reconstruct.py
 # -*- coding: utf-8 -*-
 """
-Unit tests for src/models/tour_reconstruct.py — DP result → logits → edge scores.
+Unit tests for direct reconstruction and legacy edge-score projection helpers.
 
 Usage:
   python tests/test_tour_reconstruct.py
@@ -18,11 +18,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.tour_reconstruct import (
-    dp_result_to_logits,
-    dp_result_to_edge_scores,
-    reconstruct_tour_direct,
-)
+from src.models.tour_reconstruct import reconstruct_tour_direct
+from src.models.tour_reconstruct_legacy import dp_result_to_edge_scores, dp_result_to_logits
 from src.models.dp_runner import OnePassDPRunner, OnePassDPResult, CostTableEntry
 from src.models.merge_decoder import MergeDecoder
 from src.models.bc_state_catalog import build_boundary_state_catalog
@@ -269,7 +266,7 @@ def _run_dp(Ti=8, Tc=4, P=4, d=64):
 
     catalog = build_boundary_state_catalog(num_slots=Ti, max_used=4, device=torch.device("cpu"))
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5, fallback_exact=True)
+    runner = OnePassDPRunner(r=4, max_used=4, fallback_exact=True)
     result = runner.run_single(
         tokens=tokens, leaves=leaves,
         leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
@@ -463,7 +460,6 @@ def test_end_to_end_dp_to_tour():
         pos=pos,
         spanner_edge_index=spanner_edge_index,
         edge_logit=edge_logit_full,
-        prefer_spanner_only=True,
         allow_off_spanner_patch=False,
     )
 

@@ -42,8 +42,8 @@ C_B[σ] = Σ C_{B_i}[τ_i]           →  dp_runner._lookup_child_costs()
 
 σ* = argmin C_root                  →  dp_runner: valid_costs.argmin()
 Traceback                           →  dp_runner._traceback() → leaf_states
-Tour reconstruct                    →  tour_reconstruct.dp_result_to_edge_scores()
-                                       → EdgeScores → greedy decode
+Tour reconstruct                    →  tour_reconstruct.reconstruct_tour_direct()
+                                       → Hamiltonian cycle / length
 ```
 
 ## 2. 模块架构
@@ -100,7 +100,7 @@ Output:
   - 每个 slot: activation (1) + mate_onehot (Ti) → MLP → d_model
   - Masked mean pooling over valid slots
 - `ParentMemory`：缓存的 self-attended token 序列
-- `MergeDecoderModule`：完整解码器
+- `MergeDecoder`：完整解码器
   - `build_parent_memory(...)` → ParentMemory（per-node，一次）
   - `decode_sigma(σ, memory)` → child_scores [B, 4, Ti]（per-σ）
   - `decode_sigma_batch(σ_batch, memory)` → child_scores [S, 4, Ti]（批量σ）
@@ -123,15 +123,14 @@ for depth d = max_depth → 0:
         parent_memory = MergeDecoder.build_parent_memory(z[node], children_z)
 
         for σ in valid_states(node):
-            # 三级 fallback:
-            # 1. PARSE(decode_sigma(σ)) → VERIFY → cost lookup
-            # 2. PARSE_TOPK(K=5) → VERIFY → cost lookup
-            # 3. Exact enumeration (≤10000 combinations)
+            # 当前主流程:
+            # 1. catalog_enum + neural ranking
+            # 2. 若 child catalog cap 截断后仍失败，则回退到 uncapped exact enumeration
 
             child_scores = decode_sigma_batch(all_σ)
             for each σ:
-                τ = parse_continuous(sigmoid(child_scores[σ]))
-                if verify_tuple(σ, τ):
+                τ = parse_by_catalog_enum(sigmoid(child_scores[σ]))
+                if τ is feasible:
                     C[node][σ] = Σ C[child][τ_i]
                 else:
                     try topk_parse → exact_fallback
@@ -275,7 +274,6 @@ python -m src.cli.evaluate --benchmark onepass --ckpt <path> --data_pt <path>
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--dp_max_used` | 4 | 状态枚举 max_used |
-| `--dp_topk` | 5 | PARSE_TOPK 的 K |
 | `--dp_max_sigma` | 0 | 每个节点最大枚举 σ 数；`0` 表示不截断，`>0` 为启发式截断 |
 | `--dp_child_catalog_cap` | 0 | `catalog_enum` 中每个 child 在 C1 过滤和排序后保留的最大 state 数；`0` 表示不截断 |
 | `--dp_fallback_exact` | True | 是否启用精确枚举回退 |

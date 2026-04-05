@@ -30,7 +30,7 @@ This file implements a callable nn.Module matching the LeafEncoder Protocol used
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -74,7 +74,6 @@ class LeafEncoder(nn.Module):
         tokenizer_mlp_layers: int = 2,
         use_angle_sincos: bool = True,
         max_depth: int = 64,
-        return_aux: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -85,7 +84,6 @@ class LeafEncoder(nn.Module):
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads}).")
 
         self.d_model = int(d_model)
-        self.return_aux = bool(return_aux)
 
         # Tokenizer for interface/cross only; we disable node_ctx and type_embed here
         # so that leaf encoder can add ONE consistent node_ctx/type embedding to all token groups.
@@ -183,12 +181,8 @@ class LeafEncoder(nn.Module):
         cross_is_leaf_internal: Tensor,   # [B,Tc] bool
         leaf_points_xy: Tensor,           # [B,P,2] (cell-relative normalized coords; see header doc)
         leaf_points_mask: Tensor,         # [B,P] bool
-    ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
-        """
-        Return:
-          z_leaf: [B,d_model]
-          optionally (z_leaf, aux_dict)
-        """
+    ) -> Tensor:
+        """Return `z_leaf` with shape `[B, d_model]`."""
         self._check_shapes_leaf(
             node_feat_rel=node_feat_rel,
             node_depth=node_depth,
@@ -253,13 +247,4 @@ class LeafEncoder(nn.Module):
         # ---- 6) Pool (CLS) ----
         z_leaf = cls_pool(out_tokens, cls_index=mem.cls_index)  # [B,d]
 
-        if not self.return_aux:
-            return z_leaf
-
-        aux: Dict[str, Tensor] = {
-            "T_total": torch.tensor([tokens.shape[1]], device=device),
-            "T_base": torch.tensor([base_tokens.shape[1]], device=device),
-            "T_points": torch.tensor([P], device=device),
-            "num_points_valid": leaf_points_mask.sum(dim=1).to(dtype=torch.long),  # [B]
-        }
-        return z_leaf, aux
+        return z_leaf

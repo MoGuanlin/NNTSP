@@ -19,13 +19,10 @@ Output:
   - child boundary conditions: child_iface_logit [B,4,Ti]
     (each child's interface usage logits)
 
-Two modes:
-  - mode="two_stage" (default):
+Execution mode:
+  - fixed two-stage decode:
       Stage A: build parent memory (self-attention) conditioned on bc_in + z_v (+ child latents)
       Stage B: child iface tokens query parent memory via cross-attention
-  - mode="one_stage":
-      Put child iface tokens into the same token set and do one self-attention;
-      read out child logits from child iface token outputs.
 
 No extra child↔child coupling layer is used (crossing tokens are the explicit constraint channel).
 All token lengths are O(1) in N, hence fully scale-invariant.
@@ -34,7 +31,7 @@ All token lengths are O(1) in N, hence fully scale-invariant.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -44,22 +41,17 @@ from .set_transformer_block import FeedForward, SetTransformerBlock
 from .tokenization import NodeTokenizer
 from .bc_state_catalog import state_logits_to_expected_iface_usage
 
-Mode = Literal["two_stage", "one_stage"]
-
-
 @dataclass
 class TopDownDecoderOutput:
     """
     iface_logit:       local per-node iface logits            [B, Ti]
     cross_logit:       local per-node crossing logits         [B, Tc]
     child_iface_logit: per-child iface logits (boundary cond) [B, 4, Ti]
-    aux:               optional debug stats
     """
     iface_logit: Tensor
     cross_logit: Tensor
     child_iface_logit: Tensor
     child_state_logit: Optional[Tensor]
-    aux: Dict[str, Tensor]
 
 
 class CrossAttentionBlock(nn.Module):
@@ -136,9 +128,9 @@ class CrossAttentionBlock(nn.Module):
         return q
 
 
-class TopDownDecoderModule(nn.Module):
+class TopDownDecoder(nn.Module):
     """
-    Boundary-condition decoder with optional two-stage cross-attn.
+    Boundary-condition decoder with fixed two-stage cross-attn.
 
     IMPORTANT:
     - This module assumes the packer guarantees a *stable order* of interfaces
@@ -159,11 +151,9 @@ class TopDownDecoderModule(nn.Module):
         ff_mult: int = 4,
         max_depth: int = 64,
         use_angle_sincos: bool = True,
-        mode: Mode = "two_stage",
         state_mode: str = "iface",
         num_states: int | None = None,
         bc_clip: float = 20.0,
-        return_aux: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -176,8 +166,6 @@ class TopDownDecoderModule(nn.Module):
             raise ValueError("cross_num_layers must be positive.")
         if max_depth <= 0:
             raise ValueError("max_depth must be positive.")
-        if mode not in ("two_stage", "one_stage"):
-            raise ValueError(f"Unknown mode: {mode}")
         if state_mode not in ("iface", "matching"):
             raise ValueError(f"Unknown state_mode: {state_mode}")
         if state_mode == "matching" and (num_states is None or int(num_states) <= 0):
@@ -186,11 +174,9 @@ class TopDownDecoderModule(nn.Module):
             raise ValueError("bc_clip must be positive.")
 
         self.d_model = int(d_model)
-        self.mode: Mode = mode
         self.state_mode = str(state_mode)
         self.num_states = None if num_states is None else int(num_states)
         self.bc_clip = float(bc_clip)
-        self.return_aux = bool(return_aux)
 
         # Parent tokenizer: CLS + IFACE + CROSS + CHILD(4 latents)
         # (Note: this tokenizer does NOT embed child-iface tokens; those are embedded below.)
@@ -476,7 +462,7 @@ class TopDownDecoderModule(nn.Module):
         bc_emb = self.bc_proj(bc.unsqueeze(-1))  # [B,Ti,d]
         tokens[:, mem.iface_slice, :] = tokens[:, mem.iface_slice, :] + bc_emb
 
-        # ---- prepare child iface queries (always built; used differently per mode) ----
+        # ---- prepare child iface queries ----
         child_tok, child_tok_mask = self._embed_child_iface_tokens(
             child_node_feat_rel=child_node_feat_rel,
             child_node_depth=child_node_depth,
@@ -490,23 +476,10 @@ class TopDownDecoderModule(nn.Module):
         child_q = child_tok.reshape(B, 4 * Ti, self.d_model)
         child_q_mask = child_tok_mask.reshape(B, 4 * Ti).bool()
 
-        # ---- A') build memory with parent blocks (and optionally include queries for one_stage) ----
-        if self.mode == "one_stage":
-            base_T = int(tokens.shape[1])
-            tokens_all = torch.cat([tokens, child_q], dim=1)          # [B, base_T+4Ti, d]
-            mask_all = torch.cat([mask, child_q_mask], dim=1)         # [B, base_T+4Ti]
-            x = tokens_all
-            for blk in self.parent_blocks:
-                x = blk(x, mask_all)
-
-            # slices: parent part uses mem slices; child query part is the tail
-            parent_x = x[:, :base_T, :]
-            child_x = x[:, base_T:, :]  # [B,4Ti,d]
-        else:
-            parent_x = tokens
-            for blk in self.parent_blocks:
-                parent_x = blk(parent_x, mask)
-            child_x = None  # filled by cross-attn below
+        # ---- A') build parent memory ----
+        parent_x = tokens
+        for blk in self.parent_blocks:
+            parent_x = blk(parent_x, mask)
 
         # ---- local logits from parent memory ----
         iface_out = parent_x[:, mem.iface_slice, :]  # [B,Ti,d]
@@ -520,24 +493,19 @@ class TopDownDecoderModule(nn.Module):
         cross_logit = torch.where(cross_mask.bool(), cross_logit, neg_inf)
 
         # ---- child boundary logits ----
-        if self.mode == "one_stage":
-            assert child_x is not None
-            child_iface_logit_flat = self.child_iface_head(child_x).squeeze(-1)  # [B,4Ti]
-        else:
-            # two_stage: cross-attend queries to parent memory
-            q = child_q
-            kv = parent_x
-            kv_mask = mask
-            for blk in self.cross_blocks:
-                q = blk(q=q, q_mask=child_q_mask, kv=kv, kv_mask=kv_mask)
-            child_iface_logit_flat = self.child_iface_head(q).squeeze(-1)  # [B,4Ti]
+        q = child_q
+        kv = parent_x
+        kv_mask = mask
+        for blk in self.cross_blocks:
+            q = blk(q=q, q_mask=child_q_mask, kv=kv, kv_mask=kv_mask)
+        child_iface_logit_flat = self.child_iface_head(q).squeeze(-1)  # [B,4Ti]
 
         child_iface_logit = child_iface_logit_flat.reshape(B, 4, Ti)
         child_state_logit: Optional[Tensor] = None
 
         if self.state_mode == "matching":
             assert self.child_state_head is not None
-            child_feat = (child_x if self.mode == "one_stage" else q).reshape(B, 4, Ti, self.d_model)
+            child_feat = q.reshape(B, 4, Ti, self.d_model)
             child_valid = child_tok_mask.bool()
             denom = child_valid.sum(dim=2, keepdim=True).clamp_min(1).to(dtype=child_feat.dtype)
             child_summary = (child_feat * child_valid.unsqueeze(-1).to(dtype=child_feat.dtype)).sum(dim=2) / denom
@@ -550,24 +518,11 @@ class TopDownDecoderModule(nn.Module):
         valid_child_iface = child_tok_mask.bool()  # already AND with child_exists
         child_iface_logit = torch.where(valid_child_iface, child_iface_logit, neg_inf)
 
-        aux: Dict[str, Tensor] = {}
-        if self.return_aux:
-            aux = {
-                "num_parent_iface_valid": iface_mask.sum(dim=1).to(dtype=torch.long),
-                "num_parent_cross_valid": cross_mask.sum(dim=1).to(dtype=torch.long),
-                "num_child_iface_valid_total": valid_child_iface.sum(dim=(1, 2)).to(dtype=torch.long),
-                "has_any_child": child_exists_mask.any(dim=1).to(dtype=torch.long),
-            }
-
         return TopDownDecoderOutput(
             iface_logit=iface_logit,
             cross_logit=cross_logit,
             child_iface_logit=child_iface_logit,
             child_state_logit=child_state_logit,
-            aux=aux,
         )
 
-
-# Public alias
-TopDownDecoder = TopDownDecoderModule
-__all__ = ["TopDownDecoder", "TopDownDecoderModule", "TopDownDecoderOutput"]
+__all__ = ["TopDownDecoder", "TopDownDecoderOutput"]

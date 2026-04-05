@@ -18,14 +18,14 @@ from typing import List
 import torch
 from torch.utils.data import DataLoader, Subset
 
+from src.cli.common import load_dataset
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 from src.cli.train_onepass import (
     PrecomputedBatch,
     OnePassWorker,
     _collect_teacher_max_used_stats,
     _log_teacher_max_used_stats,
 )
-from src.cli.eval_and_vis import load_dataset
-from src.models.labeler import PseudoLabeler
 from src.models.node_token_packer import NodeTokenPacker
 from src.utils.lkh_solver import default_lkh_executable
 
@@ -39,8 +39,11 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--sample_idx", type=int, default=0)
     parser.add_argument("--sample_idx_end", type=int, default=None)
-    parser.add_argument("--teacher_lkh_runs", type=int, default=1)
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
+    add_teacher_lkh_args(
+        parser,
+        runs_help="number of LKH runs for sparse-spanner teacher generation",
+        timeout_help="timeout in seconds for one sparse-spanner teacher solve (0 disables timeout)",
+    )
     parser.add_argument("--lkh_exe", type=str, default=default_lkh_executable())
     parser.add_argument(
         "--skip_teacher_failures",
@@ -63,14 +66,10 @@ def main(argv: List[str] | None = None) -> None:
         state_mode="matching",
         matching_max_used=int(args.matching_max_used),
     )
-    labeler = PseudoLabeler(
-        two_opt_passes=30,
-        use_lkh=False,
+    labeler = build_spanner_teacher_labeler(
         lkh_exe=str(args.lkh_exe),
+        config=teacher_lkh_config_from_args(args),
         prefer_cpu=True,
-        teacher_mode="spanner_lkh",
-        teacher_lkh_runs=int(args.teacher_lkh_runs),
-        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
     print(f"[teacher] signature={labeler.label_signature()}")
     print(f"[teacher] lkh={labeler.lkh_exe}")

@@ -3,10 +3,11 @@
 """
 Evaluation script for the 1-pass DP pipeline.
 
-Replaces the 2-pass neural inference (BU + TD → edge_logit) with:
-  OnePassDPRunner → dp_result_to_edge_scores → edge_logit
+Primary output:
+  OnePassDPRunner -> direct traceback reconstruction
 
-Then reuses the same greedy / exact / LKH decoding backends.
+Optional downstream greedy / exact / guided-LKH baselines still reuse the
+legacy edge-score projection path explicitly.
 
 Usage:
   python -m src.cli.eval_onepass --ckpt <path> --data_pt <path> [options]
@@ -31,7 +32,7 @@ from src.cli.common import (
     parse_bool_arg,
     resolve_device,
 )
-from src.cli.eval_and_vis import (
+from src.cli.eval_profiles import (
     AVAILABLE_SETTINGS,
     DEFAULT_SETTINGS,
     SETTING_ALIASES,
@@ -40,8 +41,16 @@ from src.cli.eval_and_vis import (
     SETTING_GROUPS,
     placeholder_result,
 )
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
+from src.cli.eval_task_factory import (
+    build_decode_task,
+    build_lkh_task,
+    mask_edge_logits_with_coverage,
+    prepare_decode_inputs,
+)
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
 from src.cli.model_factory import load_onepass_eval_models
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 
 
 def _sort_depth_items(depth_stats: Any) -> List[tuple[str, Dict[str, float]]]:
@@ -113,7 +122,6 @@ def main(argv: List[str] | None = None):
 
     # DP parameters
     parser.add_argument("--dp_max_used", type=int, default=4)
-    parser.add_argument("--dp_topk", type=int, default=5)
     parser.add_argument(
         "--dp_max_sigma",
         type=int,
@@ -124,26 +132,54 @@ def main(argv: List[str] | None = None):
         "--dp_fallback_exact",
         type=parse_bool_arg,
         default=True,
-        help="enable exact fallback: heuristic parse falls back to exact search, and catalog_enum child-cap falls back to uncapped enumeration",
+        help="enable exact fallback after catalog-enum child-cap truncation misses a feasible tuple",
     )
     parser.add_argument("--dp_leaf_workers", type=int, default=16,
                         help="number of parallel workers for leaf_exact_solve (0=sequential)")
-    parser.add_argument("--dp_parse_mode", type=str, default="catalog_enum",
-                        choices=["catalog_enum", "heuristic"],
-                        help="PARSE mode: 'catalog_enum' (default, exact) or 'heuristic' (legacy)")
+    parser.add_argument("--dp_parse_workers", type=int, default=0,
+                        help="number of CPU workers for factorized per-node exact parse/verify (0=sequential)")
     parser.add_argument(
         "--dp_child_catalog_cap",
         type=int,
         default=0,
         help="after C1 filtering and ranking in catalog_enum, keep at most this many child states; 0 disables truncation",
     )
+    parser.add_argument(
+        "--dp_parse_mode",
+        type=str,
+        default="catalog_enum",
+        choices=[
+            "catalog_enum",
+            "catalog_enum_iface_mate",
+            "catalog_widening",
+            "catalog_widening_iface_mate",
+            "factorized_widening",
+            "factorized_widening_iface_mate",
+            "heuristic",
+        ],
+        help="1-pass parse mode; iface_mate modes require a checkpoint trained with decoder_variant=iface_mate",
+    )
+    parser.add_argument(
+        "--dp_child_catalog_widening",
+        type=str,
+        default="8,16,32,64",
+        help="comma-separated widening caps for catalog_widening modes; empty disables widening rounds",
+    )
+    parser.add_argument(
+        "--dp_catalog_mate_lambda",
+        type=float,
+        default=1.0,
+        help="weight of mate compatibility term when dp_parse_mode=catalog_enum_iface_mate",
+    )
 
     # Teacher
-    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
-    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
     parser.add_argument("--lkh_exe", type=str, default=default_lkh)
-    parser.add_argument("--teacher_lkh_runs", type=int, default=1)
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
+    add_guided_lkh_args(parser)
+    add_teacher_lkh_args(
+        parser,
+        runs_help="number of LKH runs for sparse-spanner teacher generation",
+        timeout_help="timeout in seconds for one sparse-spanner teacher solve (0 disables timeout)",
+    )
 
     # Optional downstream decode settings
     parser.add_argument("--settings", type=str, default=None,
@@ -170,7 +206,6 @@ def main(argv: List[str] | None = None):
         default=(),
         aliases=SETTING_ALIASES,
         groups=SETTING_GROUPS,
-        enable_exact=False,
     )
     # For 1-pass eval, direct traceback is the primary output.
     # Greedy / exact / guided LKH remain available as explicit opt-in re-decoders.
@@ -180,16 +215,16 @@ def main(argv: List[str] | None = None):
         print("[eval] optional decode settings: none (direct traceback only)")
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     print(f"[env] device={device}")
 
     # ─── Imports ──────────────────────────────────────────────────────
     from src.models.bc_state_catalog import build_boundary_state_catalog
     from src.models.decode_backend import DecodingDataset
     from src.models.dp_runner import OnePassDPRunner
-    from src.models.labeler import PseudoLabeler
     from src.models.lkh_decode import solve_with_lkh_parallel
     from src.models.node_token_packer import NodeTokenPacker
-    from src.models.tour_reconstruct import dp_result_to_edge_scores
+    from src.models.tour_reconstruct_legacy import dp_result_to_edge_scores
     from src.visualization.visualize_direct_reconstruction_failure import (
         save_direct_reconstruction_failure_plot,
     )
@@ -201,7 +236,6 @@ def main(argv: List[str] | None = None):
         ckpt_path=args.ckpt,
         device=device,
         r=r,
-        default_matching_max_used=int(args.dp_max_used),
     )
     d_model = model_bundle.d_model
     Ti = model_bundle.num_iface_slots
@@ -209,9 +243,7 @@ def main(argv: List[str] | None = None):
     leaf_encoder = model_bundle.leaf_encoder
     merge_encoder = model_bundle.merge_encoder
     merge_decoder = model_bundle.merge_decoder
-    if not model_bundle.merge_decoder_loaded:
-        print("[warn] No merge_decoder in checkpoint, using random weights")
-    print(f"[ckpt] loaded (d={d_model}, r={r}, Ti={Ti})")
+    print(f"[ckpt] loaded (d={d_model}, r={r}, Ti={Ti}, decoder_variant={model_bundle.decoder_variant})")
 
     # ─── Dataset ──────────────────────────────────────────────────────
     dataset = load_dataset(args.data_pt)
@@ -220,37 +252,43 @@ def main(argv: List[str] | None = None):
     end_idx = min(end_idx, len(dataset))
     num_samples = end_idx - start_idx
 
+    structured_parse_mode = str(args.dp_parse_mode).startswith("factorized_widening")
+    iface_order = str(model_bundle.iface_order)
+    if structured_parse_mode and iface_order != "clockwise":
+        raise ValueError(
+            "factorized_widening requires a checkpoint packed with clockwise interface order, "
+            f"got iface_order={iface_order!r}"
+        )
     packer = NodeTokenPacker(
         r=r,
-        state_mode="matching",
+        state_mode=("iface" if structured_parse_mode else "matching"),
+        iface_order=iface_order,
         matching_max_used=matching_max_used,
     )
-    labeler = PseudoLabeler(
-        two_opt_passes=int(args.two_opt_passes),
-        use_lkh=bool(args.use_lkh),
+    labeler = build_spanner_teacher_labeler(
         lkh_exe=str(args.lkh_exe),
+        config=teacher_lkh_config_from_args(args),
         prefer_cpu=True,
-        teacher_mode="spanner_lkh",
-        teacher_lkh_runs=int(args.teacher_lkh_runs),
-        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
     print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
 
     dp_runner = OnePassDPRunner(
         r=r,
         max_used=matching_max_used,
-        topk=int(args.dp_topk),
         max_sigma_enumerate=int(args.dp_max_sigma),
         max_child_catalog_states=int(args.dp_child_catalog_cap),
+        child_catalog_widening=str(args.dp_child_catalog_widening),
         fallback_exact=bool(args.dp_fallback_exact),
         num_leaf_workers=int(args.dp_leaf_workers),
+        num_parse_workers=int(args.dp_parse_workers),
         parse_mode=str(args.dp_parse_mode),
+        catalog_mate_lambda=float(args.dp_catalog_mate_lambda),
     )
     catalog = build_boundary_state_catalog(
         num_slots=Ti,
         max_used=matching_max_used,
         device=device,
-    )
+    ) if not structured_parse_mode else None
 
     # Auto-generate unique output dir: {base}/{ckpt_run}_{step}_{timestamp}/
     import json
@@ -287,7 +325,13 @@ def main(argv: List[str] | None = None):
         # ── Pure complete-graph LKH (log FIRST so long DP runs still leave a reference) ──
         log_progress(prefix, "computing pure complete-graph LKH...")
         pure_lkh_result = solve_with_lkh_parallel(
-            [{"pos": data.pos.detach().cpu(), "mode": "pure", "teacher_len": float("nan")}],
+            [
+                build_lkh_task(
+                    pos=data.pos,
+                    mode="pure",
+                    teacher_len=float("nan"),
+                )
+            ],
             lkh_executable=args.lkh_exe,
             num_workers=1,
         )[0][0]
@@ -357,16 +401,22 @@ def main(argv: List[str] | None = None):
                 num_edges=data.spanner_edge_index.shape[1],
             )
 
-            el = edge_scores.edge_logit.clone()
-            em = edge_scores.edge_mask.bool()
-            el[~em] = -1e9
+            el = mask_edge_logits_with_coverage(
+                edge_scores.edge_logit,
+                edge_scores.edge_mask,
+            )
             t_total = time.time()
 
+        pos_cpu, edge_index_cpu, el_cpu = prepare_decode_inputs(
+            pos=data.pos,
+            spanner_edge_index=data.spanner_edge_index,
+            edge_logit=el,
+        )
         mo = {
             "s_idx": s_idx,
-            "pos": data.pos.cpu(),
-            "edge_index": data.spanner_edge_index.cpu(),
-            "edge_logit": el.cpu(),
+            "pos": pos_cpu,
+            "edge_index": edge_index_cpu,
+            "edge_logit": el_cpu,
             "dp_cost": dp_result.tour_cost,
             "direct_tour_length": dp_result.tour_length,
             "direct_tour_feasible": dp_result.tour_feasible,
@@ -448,7 +498,13 @@ def main(argv: List[str] | None = None):
     if need_greedy:
         print("[eval] Phase 2: Running Greedy decoding...")
         greedy_tasks = [
-            (mo["pos"], mo["edge_index"], mo["edge_logit"], True, True, mo["teacher_len"])
+            build_decode_task(
+                pos=mo["pos"],
+                spanner_edge_index=mo["edge_index"],
+                edge_logit=mo["edge_logit"],
+                teacher_len=mo["teacher_len"],
+                allow_off_spanner_patch=True,
+            )
             for mo in model_outputs
         ]
         g_dataset = DecodingDataset(greedy_tasks)
@@ -465,7 +521,13 @@ def main(argv: List[str] | None = None):
     if "exact" in selected_settings:
         print("[eval] Phase 3: Running Exact sparse decoding...")
         exact_tasks = [
-            (mo["pos"], mo["edge_index"], mo["edge_logit"], True, False, mo["teacher_len"])
+            build_decode_task(
+                pos=mo["pos"],
+                spanner_edge_index=mo["edge_index"],
+                edge_logit=mo["edge_logit"],
+                teacher_len=mo["teacher_len"],
+                allow_off_spanner_patch=False,
+            )
             for mo in model_outputs
         ]
         ex_dataset = DecodingDataset(
@@ -498,15 +560,22 @@ def main(argv: List[str] | None = None):
                 initial_tour = mo["direct_tour_order"] if mo["direct_tour_feasible"] else (
                     gr.order if gr.feasible else None
                 )
-                tasks = [{
-                    "pos": mo["pos"],
-                    "mode": "guided",
-                    "edge_index": mo["edge_index"],
-                    "edge_logit": mo["edge_logit"],
-                    "teacher_len": mo["teacher_len"],
-                    "initial_tour": initial_tour,
-                }]
-            results = solve_with_lkh_parallel(tasks, lkh_executable=args.lkh_exe, num_workers=1)
+                tasks = [
+                    build_lkh_task(
+                        pos=mo["pos"],
+                        mode="guided",
+                        edge_index=mo["edge_index"],
+                        edge_logit=mo["edge_logit"],
+                        teacher_len=mo["teacher_len"],
+                        initial_tour=initial_tour,
+                    )
+                ]
+            results = solve_with_lkh_parallel(
+                tasks,
+                lkh_executable=args.lkh_exe,
+                num_workers=1,
+                guided_config=guided_config,
+            )
             lkh_results[s][i] = results[0][0]
 
     # ─── Collect, log per-sample, & print summary ──────────────────────

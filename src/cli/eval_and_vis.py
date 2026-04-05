@@ -15,69 +15,25 @@ import matplotlib.pyplot as plt
 import torch
 
 from src.cli.common import load_dataset, log_progress, move_data_tensors_to_device, parse_bool_arg, resolve_device
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
+from src.cli.eval_profiles import (
+    AVAILABLE_SETTINGS,
+    DEFAULT_SETTINGS,
+    SETTING_ALIASES,
+    SETTING_COLORS,
+    SETTING_DISPLAY_NAMES,
+    SETTING_GROUPS,
+    placeholder_result,
+)
+from src.cli.eval_task_factory import (
+    build_decode_task,
+    build_lkh_task,
+    mask_edge_logits_with_coverage,
+    prepare_decode_inputs,
+)
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
 from src.cli.model_factory import load_twopass_eval_models
-
-
-AVAILABLE_SETTINGS = (
-    "greedy",
-    "exact",
-    "spanner_uniform_lkh",
-    "guided_lkh",
-    "pure_lkh",
-    "pomo",
-    "neurolkh",
-)
-
-DEFAULT_SETTINGS = (
-    "greedy",
-    "guided_lkh",
-    "pure_lkh",
-    "pomo",
-    "neurolkh",
-)
-
-SETTING_GROUPS = {
-    "default": DEFAULT_SETTINGS,
-    "all": ("greedy", "exact", "spanner_uniform_lkh", "guided_lkh", "pure_lkh", "pomo", "neurolkh"),
-    "ours": ("greedy", "exact", "guided_lkh"),
-    "baselines": ("pomo", "neurolkh"),
-    "reference": ("pure_lkh",),
-    "lkh": ("spanner_uniform_lkh", "guided_lkh", "pure_lkh"),
-    "practical_lkh": ("spanner_uniform_lkh", "guided_lkh", "pure_lkh"),
-}
-
-SETTING_ALIASES = {
-    "spanner": "spanner_uniform_lkh",
-    "spanner_only": "spanner_uniform_lkh",
-    "spanner_lkh": "spanner_uniform_lkh",
-    "uniform_lkh": "spanner_uniform_lkh",
-    "guided": "guided_lkh",
-    "guidedlkh": "guided_lkh",
-    "pure": "pure_lkh",
-    "lkh_pure": "pure_lkh",
-    "ex": "exact",
-}
-
-SETTING_DISPLAY_NAMES = {
-    "greedy": "Greedy",
-    "exact": "Exact Sparse",
-    "spanner_uniform_lkh": "Spanner-only LKH",
-    "guided_lkh": "Guided LKH",
-    "pure_lkh": "Pure LKH",
-    "pomo": "POMO",
-    "neurolkh": "NeuroLKH",
-}
-
-SETTING_COLORS = {
-    "greedy": "red",
-    "exact": "darkorange",
-    "spanner_uniform_lkh": "teal",
-    "guided_lkh": "blue",
-    "pure_lkh": "green",
-    "pomo": "purple",
-    "neurolkh": "brown",
-}
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 
 def plot_tour(pos, edge_index, ax, color="blue", lw=1.5, alpha=1.0, label=None, linestyle="-"):
     pos_np = pos.detach().cpu().numpy()
@@ -100,9 +56,6 @@ def prepare_edges(order, device: torch.device) -> torch.Tensor:
     nxt = torch.roll(model_order, shifts=-1, dims=0)
     return torch.stack([model_order, nxt], dim=0)
 
-
-def placeholder_result() -> SimpleNamespace:
-    return SimpleNamespace(feasible=False, length=float("inf"), duration=0.0, order=[])
 
 def load_pomo(device: torch.device, ckpt_path: str):
     from src_baselines.pomo.POMO.TSPEnv import TSPEnv
@@ -177,15 +130,16 @@ def main(argv: List[str] | None = None):
     parser.add_argument("--output_dir", type=str, default="outputs/eval")
     parser.add_argument("--use_iface_in_decode", type=parse_bool_arg, default=True)
     parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
-    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
+    add_guided_lkh_args(parser)
     parser.add_argument("--no_vis", action="store_true", help="disable visualization")
-    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
-    parser.add_argument("--teacher_lkh_runs", type=int, default=1)
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
+    add_teacher_lkh_args(
+        parser,
+        runs_help="number of LKH runs for sparse-spanner teacher generation",
+        timeout_help="timeout in seconds for one sparse-spanner teacher solve (0 disables timeout)",
+    )
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers for parallel decoding")
-    parser.add_argument("--run_exact", action="store_true", help="legacy flag: add exact to selected settings")
     parser.add_argument("--exact_time_limit", type=float, default=30.0, help="time limit in seconds for exact sparse decoding")
     parser.add_argument("--exact_length_weight", type=float, default=0.0, help="optional Euclidean tie-break weight for exact sparse decoding")
     parser.add_argument(
@@ -212,17 +166,16 @@ def main(argv: List[str] | None = None):
         default=DEFAULT_SETTINGS,
         aliases=SETTING_ALIASES,
         groups=SETTING_GROUPS,
-        enable_exact=bool(args.run_exact),
     )
     print(f"[eval] selected settings: {', '.join(selected_settings)}")
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     print(f"[env] device={device}")
 
     from src.models.bottom_up_runner import BottomUpTreeRunner
     from src.models.decode_backend import DecodingDataset
     from src.models.edge_aggregation import aggregate_logits_to_edges
-    from src.models.labeler import PseudoLabeler
     from src.models.lkh_decode import solve_with_lkh_parallel
     from src.models.node_token_packer import NodeTokenPacker
     from src.models.top_down_runner import TopDownTreeRunner
@@ -276,14 +229,10 @@ def main(argv: List[str] | None = None):
     )
     bu_runner = BottomUpTreeRunner()
     td_runner = TopDownTreeRunner()
-    labeler = PseudoLabeler(
-        two_opt_passes=int(args.two_opt_passes),
-        use_lkh=bool(args.use_lkh),
+    labeler = build_spanner_teacher_labeler(
         lkh_exe=str(args.lkh_exe),
+        config=teacher_lkh_config_from_args(args),
         prefer_cpu=True,
-        teacher_mode="spanner_lkh",
-        teacher_lkh_runs=int(args.teacher_lkh_runs),
-        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
     print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
     output_dir = Path(args.output_dir)
@@ -311,15 +260,21 @@ def main(argv: List[str] | None = None):
                 reduce="mean",
                 num_edges=data.spanner_edge_index.shape[1],
             )
-            el = edge_scores.edge_logit.clone()
-            em = edge_scores.edge_mask.bool()
-            el[~em] = -1e9
+            el = mask_edge_logits_with_coverage(
+                edge_scores.edge_logit,
+                edge_scores.edge_mask,
+            )
+            pos_cpu, edge_index_cpu, el_cpu = prepare_decode_inputs(
+                pos=data.pos,
+                spanner_edge_index=data.spanner_edge_index,
+                edge_logit=el,
+            )
             model_outputs.append(
                 {
                     "s_idx": s_idx,
-                    "pos": data.pos.cpu(),
-                    "edge_index": data.spanner_edge_index.cpu(),
-                    "edge_logit": el.cpu(),
+                    "pos": pos_cpu,
+                    "edge_index": edge_index_cpu,
+                    "edge_logit": el_cpu,
                     "packed_tokens": packed.tokens,
                     "y_tour": data.y_tour.detach().cpu() if hasattr(data, "y_tour") and data.y_tour is not None else None,
                 }
@@ -365,7 +320,13 @@ def main(argv: List[str] | None = None):
     if need_greedy:
         print("[eval] Phase 3: Running Greedy decoding in parallel...")
         greedy_tasks = [
-            (mo["pos"], mo["edge_index"], mo["edge_logit"], True, True, mo["teacher_len"])
+            build_decode_task(
+                pos=mo["pos"],
+                spanner_edge_index=mo["edge_index"],
+                edge_logit=mo["edge_logit"],
+                teacher_len=mo["teacher_len"],
+                allow_off_spanner_patch=True,
+            )
             for mo in model_outputs
         ]
         g_dataset = DecodingDataset(greedy_tasks)
@@ -382,7 +343,13 @@ def main(argv: List[str] | None = None):
     if "exact" in selected_settings:
         print("[eval] Phase 4: Running Exact sparse decoding in parallel...")
         exact_tasks = [
-            (mo["pos"], mo["edge_index"], mo["edge_logit"], True, False, mo["teacher_len"])
+            build_decode_task(
+                pos=mo["pos"],
+                spanner_edge_index=mo["edge_index"],
+                edge_logit=mo["edge_logit"],
+                teacher_len=mo["teacher_len"],
+                allow_off_spanner_patch=False,
+            )
             for mo in model_outputs
         ]
         ex_dataset = DecodingDataset(
@@ -427,31 +394,37 @@ def main(argv: List[str] | None = None):
 
         if "spanner_uniform_lkh" in selected_settings:
             lkh_tasks.append(
-                {
-                    "pos": data_pos,
-                    "mode": "spanner_uniform",
-                    "edge_index": sp_edge_index,
-                    "teacher_len": teacher_len,
-                }
+                build_lkh_task(
+                    pos=data_pos,
+                    mode="spanner_uniform",
+                    edge_index=sp_edge_index,
+                    teacher_len=teacher_len,
+                )
             )
             lkh_task_names.append("spanner_uniform_lkh")
 
         if "guided_lkh" in selected_settings:
             greedy_res = greedy_results[i]
             lkh_tasks.append(
-                {
-                    "pos": data_pos,
-                    "mode": "guided",
-                    "edge_index": sp_edge_index,
-                    "edge_logit": el,
-                    "teacher_len": teacher_len,
-                    "initial_tour": greedy_res.order if greedy_res.feasible else None,
-                }
+                build_lkh_task(
+                    pos=data_pos,
+                    mode="guided",
+                    edge_index=sp_edge_index,
+                    edge_logit=el,
+                    teacher_len=teacher_len,
+                    initial_tour=greedy_res.order if greedy_res.feasible else None,
+                )
             )
             lkh_task_names.append("guided_lkh")
 
         if "pure_lkh" in selected_settings:
-            lkh_tasks.append({"pos": data_pos, "mode": "pure", "teacher_len": teacher_len})
+            lkh_tasks.append(
+                build_lkh_task(
+                    pos=data_pos,
+                    mode="pure",
+                    teacher_len=teacher_len,
+                )
+            )
             lkh_task_names.append("pure_lkh")
 
         if "neurolkh" in selected_settings and nlkh_model is not None:
@@ -488,13 +461,13 @@ def main(argv: List[str] | None = None):
                 )
 
                 lkh_tasks.append(
-                    {
-                        "pos": data_pos,
-                        "mode": "guided",
-                        "edge_index": nlkh_spanner_index.cpu(),
-                        "edge_logit": nlkh_edge_logit.view(-1).cpu(),
-                        "teacher_len": teacher_len,
-                    }
+                    build_lkh_task(
+                        pos=data_pos,
+                        mode="guided",
+                        edge_index=nlkh_spanner_index,
+                        edge_logit=nlkh_edge_logit.view(-1),
+                        teacher_len=teacher_len,
+                    )
                 )
                 lkh_task_names.append("neurolkh")
 
@@ -504,6 +477,7 @@ def main(argv: List[str] | None = None):
                 lkh_tasks,
                 lkh_executable=getattr(args, "lkh_exe", "LKH"),
                 num_workers=max(1, min(args.num_workers, len(lkh_tasks))),
+                guided_config=guided_config,
             )
             for setting_name, (res, _) in zip(lkh_task_names, lkh_results_all):
                 sample_results[setting_name] = res

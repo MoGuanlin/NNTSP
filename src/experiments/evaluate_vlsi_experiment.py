@@ -1,4 +1,4 @@
-# src/cli/evaluate_vlsi_experiment.py
+# src/experiments/evaluate_vlsi_experiment.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -19,8 +19,9 @@ from typing import Any, Callable, Dict, List, Sequence
 import torch
 
 from src.cli.common import parse_bool_arg, resolve_device
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
 from src.cli.evaluate_tsplib import load_neurolkh, parse_tsp_file
-from src.cli.evaluate_tsplib_compare import run_neurolkh_instance, run_twopass_guided_instance
+from src.experiments.evaluate_tsplib_compare import run_neurolkh_instance, run_twopass_guided_instance
 from src.cli.graph_pipeline import (
     build_spanner_builder,
     preprocess_points_to_hierarchy,
@@ -29,6 +30,7 @@ from src.cli.graph_pipeline import (
 from src.cli.model_factory import load_twopass_eval_models
 from src.graph.build_raw_pyramid import RawPyramidBuilder
 from src.models.bottom_up_runner import BottomUpTreeRunner
+from src.models.lkh_decode import GuidedLKHConfig
 from src.models.node_token_packer import NodeTokenPacker
 from src.models.top_down_runner import TopDownTreeRunner
 from src.utils.lkh_solver import default_lkh_executable, resolve_lkh_executable
@@ -394,7 +396,7 @@ def run_guided_for_instance(
     heartbeat_sec: float,
     output_path: Path,
     components: Dict[str, Any],
-    guided_top_k: int,
+    guided_config: GuidedLKHConfig,
     num_workers: int,
     spanner_mode: str,
     patching_mode: str,
@@ -486,7 +488,7 @@ def run_guided_for_instance(
                     bu_runner=bu_runner,
                     td_runner=td_runner,
                     use_iface_in_decode=bool(use_iface_in_decode),
-                    guided_top_k=int(guided_top_k),
+                    guided_config=guided_config,
                     lkh_exe=str(lkh_exe),
                     lkh_runs=int(lkh_runs),
                     lkh_timeout=lkh_timeout,
@@ -622,7 +624,7 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
     parser.add_argument("--patching_mode", type=str, default="prune", choices=("prune", "arora"))
     parser.add_argument("--theta_k", type=int, default=14)
-    parser.add_argument("--guided_top_k", type=int, default=20)
+    add_guided_lkh_args(parser)
     parser.add_argument("--num_workers", type=int, default=4, help="workers used by spanner build and NeuroLKH/LKH solve")
     parser.add_argument("--bottom_up_chunk", type=int, default=64, help="max nodes per bottom-up chunk for large-instance stability")
     parser.add_argument("--top_down_chunk", type=int, default=32, help="max nodes per top-down chunk for large-instance stability")
@@ -666,6 +668,7 @@ def main(argv: List[str] | None = None) -> None:
         )
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     lkh_exe = resolve_lkh_executable(str(args.lkh_exe))
     lkh_timeout = None if float(args.lkh_timeout) <= 0 else float(args.lkh_timeout)
     guided_key = build_guided_key(
@@ -715,7 +718,14 @@ def main(argv: List[str] | None = None) -> None:
         "spanner_mode": str(args.spanner_mode),
         "patching_mode": str(args.patching_mode),
         "theta_k": int(args.theta_k),
-        "guided_top_k": int(args.guided_top_k),
+        "guided_lkh": {
+            "top_k": int(guided_config.top_k),
+            "logit_scale": float(guided_config.logit_scale),
+            "subgradient": bool(guided_config.subgradient),
+            "max_candidates": guided_config.max_candidates,
+            "max_trials": guided_config.max_trials,
+            "use_initial_tour": bool(guided_config.use_initial_tour),
+        },
         "num_workers": int(args.num_workers),
         "bottom_up_chunk": int(args.bottom_up_chunk),
         "top_down_chunk": int(args.top_down_chunk),
@@ -776,7 +786,7 @@ def main(argv: List[str] | None = None) -> None:
                     heartbeat_sec=float(args.heartbeat_sec),
                     output_path=result_path,
                     components=guided_components,
-                    guided_top_k=int(args.guided_top_k),
+                    guided_config=guided_config,
                     num_workers=int(args.num_workers),
                     spanner_mode=str(args.spanner_mode),
                     patching_mode=str(args.patching_mode),

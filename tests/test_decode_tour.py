@@ -70,7 +70,7 @@ def main() -> None:
     from src.models.bottom_up_runner import BottomUpTreeRunner
     from src.models.top_down_decoder import TopDownDecoder
     from src.models.top_down_runner import TopDownTreeRunner
-    from src.models.edge_aggregation import aggregate_cross_logits_to_edges
+    from src.models.edge_aggregation import aggregate_logits_to_edges
     from src.models.edge_decode import decode_tour_from_edge_logits
     from src.models.labeler import PseudoLabeler
 
@@ -94,7 +94,7 @@ def main() -> None:
     out_bu = bu.run_batch(batch=batch, leaf_encoder=leaf_encoder, merge_encoder=merge_encoder)
     out_td = td.run_batch(batch=batch, z=out_bu.z, decoder=decoder)
 
-    edge_scores = aggregate_cross_logits_to_edges(tokens=batch.tokens, cross_logit=out_td.cross_logit)
+    edge_scores = aggregate_logits_to_edges(tokens=batch.tokens, cross_logit=out_td.cross_logit)
     edge_logit_global = edge_scores.edge_logit
     edge_mask_global = edge_scores.edge_mask.bool()
 
@@ -110,18 +110,17 @@ def main() -> None:
         pos=data.pos,
         spanner_edge_index=data.spanner_edge_index,
         edge_logit=edge_logit_local,
-        prefer_spanner_only=True,
         allow_off_spanner_patch=True,
     )
 
     print(
         f"[decode] feasible={res.feasible} len={res.length:.2f} "
-        f"off_spanner={res.num_off_spanner_edges} broken={res.num_edges_broken} "
+        f"off_spanner={res.num_off_spanner_edges} "
         f"components0={res.num_components_initial}"
     )
 
     # Teacher length for reference
-    labeler = PseudoLabeler(two_opt_passes=30, prefer_cpu=True)
+    labeler = PseudoLabeler(prefer_cpu=True)
     t = batch.tokens
 
     class _Slice:

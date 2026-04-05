@@ -1,4 +1,4 @@
-# src/cli/evaluate_tsplib_onepass_models.py
+# src/experiments/evaluate_tsplib_onepass_models.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from src.cli.evaluate_tsplib import (
     parse_tsp_file,
     sanitize_tag,
 )
-from src.cli.evaluate_tsplib_compare import (
+from src.experiments.evaluate_tsplib_compare import (
     ONEPASS_TIMING_KEYS,
     format_gap,
     format_obj,
@@ -137,29 +137,30 @@ def expand_ckpt_specs(specs: Iterable[str]) -> List[Path]:
     return out
 
 
-def infer_r_from_path(path: Path, default_r: int) -> int:
-    for text in (path.name, path.parent.name):
-        match = re.search(r"r(\d+)", text)
-        if match:
-            return int(match.group(1))
-    return int(default_r)
-
-
 def make_model_name(ckpt_path: Path) -> str:
     parent = ckpt_path.parent.name or ckpt_path.stem
     step = format_step_label(ckpt_path)
     return f"{parent}@{step}"
 
 
-def discover_model_specs(*, ckpt_specs: Sequence[str], default_r: int, default_matching_max_used: int) -> List[ModelSpec]:
+def _require_checkpoint_arg(ckpt_args: Dict[str, object], key: str, *, ckpt_path: Path) -> object:
+    if key not in ckpt_args:
+        raise KeyError(
+            f"Checkpoint {ckpt_path} is missing args['{key}']. "
+            "This experiment no longer guesses missing model metadata from legacy checkpoints."
+        )
+    return ckpt_args[key]
+
+
+def discover_model_specs(*, ckpt_specs: Sequence[str]) -> List[ModelSpec]:
     model_specs: List[ModelSpec] = []
     used_names = set()
     for raw_path in expand_ckpt_specs(ckpt_specs):
         ckpt_path = resolve_checkpoint_path(raw_path).resolve()
         ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         ckpt_args = dict(ckpt.get("args", {}))
-        r = int(ckpt_args.get("r", infer_r_from_path(ckpt_path, default_r)))
-        matching_max_used = int(ckpt_args.get("matching_max_used", default_matching_max_used))
+        r = int(_require_checkpoint_arg(ckpt_args, "r", ckpt_path=ckpt_path))
+        matching_max_used = int(_require_checkpoint_arg(ckpt_args, "matching_max_used", ckpt_path=ckpt_path))
         model_name = make_model_name(ckpt_path)
         if model_name in used_names:
             suffix = 2
@@ -369,25 +370,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--save_dir", type=str, default="outputs/eval_tsplib_onepass_models")
     parser.add_argument("--run_tag", type=str, default=None)
     parser.add_argument("--allow_non_euc2d", action="store_true", help="allow non-EUC_2D TSPLIB instances")
-    parser.add_argument("--default_r", type=int, default=4, help="fallback r when the checkpoint args do not store it")
     parser.add_argument("--dp_max_used", type=int, default=4)
-    parser.add_argument("--dp_topk", type=int, default=5)
     parser.add_argument("--dp_max_sigma", type=int, default=0)
     parser.add_argument("--dp_child_catalog_cap", type=int, default=0)
     parser.add_argument("--dp_fallback_exact", action="store_true", default=True)
     parser.add_argument("--no_dp_fallback_exact", dest="dp_fallback_exact", action="store_false")
     parser.add_argument("--dp_leaf_workers", type=int, default=16)
-    parser.add_argument("--dp_parse_mode", type=str, default="catalog_enum", choices=("catalog_enum", "heuristic"))
     args = parser.parse_args(argv)
 
     device = resolve_device(str(args.device))
     tsplib_dir = Path(args.tsplib_dir)
     instance_names = parse_instance_name_list(args.instances)
-    model_specs = discover_model_specs(
-        ckpt_specs=args.ckpts,
-        default_r=int(args.default_r),
-        default_matching_max_used=int(args.dp_max_used),
-    )
+    model_specs = discover_model_specs(ckpt_specs=args.ckpts)
     instances = select_instances(tsplib_dir=tsplib_dir, instance_names=instance_names)
     optima = load_tsplib_optima(tsplib_dir)
 
@@ -469,15 +463,12 @@ def main(argv: Optional[List[str]] = None) -> None:
             ckpt_path=str(model_spec.ckpt_path),
             device=device,
             r=int(model_spec.r),
-            default_matching_max_used=int(model_spec.matching_max_used),
         )
-        if not model_bundle.merge_decoder_loaded:
-            print(f"{prefix} missing merge_decoder in checkpoint; skip.")
-            continue
 
         packer = NodeTokenPacker(
             r=int(model_spec.r),
             state_mode="matching",
+            iface_order=str(model_bundle.iface_order),
             matching_max_used=int(model_bundle.matching_max_used),
         )
         catalog = build_boundary_state_catalog(
@@ -488,12 +479,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         runner = OnePassDPRunner(
             r=int(model_spec.r),
             max_used=int(model_bundle.matching_max_used),
-            topk=int(args.dp_topk),
             max_sigma_enumerate=int(args.dp_max_sigma),
             max_child_catalog_states=int(args.dp_child_catalog_cap),
             fallback_exact=bool(args.dp_fallback_exact),
             num_leaf_workers=int(args.dp_leaf_workers),
-            parse_mode=str(args.dp_parse_mode),
         )
 
         for inst_info in instance_cache:
@@ -590,12 +579,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             for spec in model_specs
         ],
         "device": str(device),
-        "dp_topk": int(args.dp_topk),
         "dp_max_sigma": int(args.dp_max_sigma),
         "dp_child_catalog_cap": int(args.dp_child_catalog_cap),
         "dp_fallback_exact": bool(args.dp_fallback_exact),
         "dp_leaf_workers": int(args.dp_leaf_workers),
-        "dp_parse_mode": str(args.dp_parse_mode),
     }
     summary = build_summary(records)
     payload = {

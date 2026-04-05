@@ -1,4 +1,4 @@
-# src/cli/evaluate_tsplib_compare.py
+# src/experiments/evaluate_tsplib_compare.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -9,8 +9,6 @@ import json
 import math
 import os
 import re
-import shutil
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +23,7 @@ from src.cli.common import (
     parse_bool_arg,
     resolve_device,
 )
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
 from src.cli.graph_pipeline import build_spanner_builder, preprocess_points_to_hierarchy
 from src.cli.eval_twopass_timing import run_guided_lkh_timed, sync_device
 from src.cli.evaluate_tsplib import (
@@ -43,10 +42,15 @@ from src.models.bottom_up_runner import BottomUpTreeRunner
 from src.models.decode_backend import decode_tour, TourDecodeResult
 from src.models.dp_runner import OnePassDPRunner
 from src.models.edge_aggregation import aggregate_logits_to_edges
-from src.models.lkh_decode import build_guided_candidates, solve_with_lkh_parallel
+from src.models.lkh_decode import (
+    CandidateLKHConfig,
+    GuidedLKHConfig,
+    build_guided_candidates,
+    run_candidate_lkh_timed_from_arrays,
+    solve_with_lkh_parallel,
+)
 from src.models.node_token_packer import NodeTokenPacker
 from src.models.top_down_runner import TopDownTreeRunner
-from src.utils.lkh_solver import parse_tour, run_lkh, write_par, write_tour_file, write_tsp_euc2d
 
 
 METHODS = (
@@ -356,109 +360,6 @@ def _build_inverse_edge_index(neighbors: np.ndarray, *, progress_log_fn=None) ->
     return inverse
 
 
-def _write_candidate_file_from_arrays(path: str, neighbors: np.ndarray, alphas: np.ndarray) -> None:
-    n_nodes, _ = neighbors.shape
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{n_nodes}\n")
-        for i in range(n_nodes):
-            row_neighbors = neighbors[i]
-            row_alphas = alphas[i]
-            valid = row_neighbors >= 0
-            row_neighbors = row_neighbors[valid]
-            row_alphas = row_alphas[valid]
-            order = np.lexsort((row_neighbors, row_alphas))
-            row_neighbors = row_neighbors[order]
-            row_alphas = row_alphas[order]
-
-            line = [str(i + 1), "0", str(int(row_neighbors.shape[0]))]
-            for nb, alpha in zip(row_neighbors.tolist(), row_alphas.tolist()):
-                line.extend([str(int(nb) + 1), str(int(alpha))])
-            f.write(" ".join(line) + "\n")
-        f.write("-1\n")
-
-
-def _run_candidate_lkh_timed_from_arrays(
-    *,
-    pos: torch.Tensor,
-    neighbors: np.ndarray,
-    alphas: np.ndarray,
-    initial_tour: Optional[List[int]],
-    lkh_executable: str,
-    num_runs: int,
-    seed: int,
-    timeout: Optional[float],
-) -> tuple[Any, Dict[str, float]]:
-    from src.models.lkh_decode import LKHDecodeResult
-
-    pos_cpu = pos.detach().cpu()
-    pos_np = pos_cpu.numpy()
-
-    tmp_dir = tempfile.mkdtemp(prefix="timed_candidate_lkh_")
-    tsp_path = str(Path(tmp_dir) / "problem.tsp")
-    par_path = str(Path(tmp_dir) / "config.par")
-    tour_path = str(Path(tmp_dir) / "result.tour")
-    cand_path = str(Path(tmp_dir) / "candidates.cand")
-    init_tour_path = str(Path(tmp_dir) / "initial.itour")
-
-    setup_t0 = time.perf_counter()
-    try:
-        write_tsp_euc2d(tsp_path, "GuidedTSP", pos_np)
-        _write_candidate_file_from_arrays(cand_path, neighbors, alphas)
-
-        init_p = None
-        if initial_tour is not None:
-            write_tour_file(init_tour_path, [int(x) for x in initial_tour])
-            init_p = init_tour_path
-
-        write_par(
-            par_path,
-            tsp_path,
-            tour_path,
-            runs=max(1, int(num_runs)),
-            seed=int(seed),
-            precision=1,
-            candidate_path=cand_path,
-            initial_tour_path=init_p,
-            subgradient=False,
-            max_candidates=5,
-            max_trials=1,
-        )
-        setup_sec = time.perf_counter() - setup_t0
-
-        search_t0 = time.perf_counter()
-        ok = run_lkh(lkh_executable, par_path, timeout=timeout)
-        search_sec = time.perf_counter() - search_t0
-
-        parse_t0 = time.perf_counter()
-        order = parse_tour(tour_path) if ok else []
-        feasible = len(order) == int(pos_cpu.shape[0]) and len(set(order)) == int(pos_cpu.shape[0])
-        length = float("inf")
-        if feasible:
-            total = 0.0
-            n = len(order)
-            for i in range(n):
-                u = order[i]
-                v = order[(i + 1) % n]
-                total += float(np.linalg.norm(pos_np[u] - pos_np[v]))
-            length = total
-        parse_sec = time.perf_counter() - parse_t0
-
-        result = LKHDecodeResult(
-            order=order,
-            length=length,
-            feasible=feasible,
-            mode="guided",
-            duration=setup_sec + search_sec + parse_sec,
-        )
-        return result, {
-            "lkh_setup_io_sec": float(setup_sec),
-            "lkh_search_sec": float(search_sec),
-            "lkh_parse_sec": float(parse_sec),
-        }
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 def run_pomo_instance(
     *,
     points_cpu: torch.Tensor,
@@ -563,7 +464,7 @@ def run_neurolkh_instance(
 
     if progress_log_fn is not None:
         progress_log_fn("neurolkh stage: LKH search")
-    nlkh_res, lkh_break = _run_candidate_lkh_timed_from_arrays(
+    nlkh_res, lkh_break = run_candidate_lkh_timed_from_arrays(
         pos=points_cpu,
         neighbors=neighbor_index,
         alphas=alpha_array,
@@ -572,6 +473,8 @@ def run_neurolkh_instance(
         num_runs=1,
         seed=1234,
         timeout=lkh_timeout,
+        mode="guided",
+        candidate_config=CandidateLKHConfig(),
     )
     timing["lkh_setup_io_sec"] = float(lkh_break.get("lkh_setup_io_sec", 0.0))
     timing["lkh_search_sec"] = float(lkh_break.get("lkh_search_sec", 0.0))
@@ -689,7 +592,7 @@ def run_twopass_guided_instance(
     bu_runner: BottomUpTreeRunner,
     td_runner: TopDownTreeRunner,
     use_iface_in_decode: bool,
-    guided_top_k: int,
+    guided_config: GuidedLKHConfig,
     lkh_exe: str,
     lkh_runs: int,
     lkh_timeout: Optional[float],
@@ -777,7 +680,6 @@ def run_twopass_guided_instance(
             feasible=False,
             num_off_spanner_edges=0,
             num_components_initial=0,
-            num_edges_broken=0,
             fallback_used=False,
             num_patching_steps=0,
             duration=0.0,
@@ -791,7 +693,6 @@ def run_twopass_guided_instance(
             spanner_edge_index=data_dev.spanner_edge_index.detach().cpu(),
             edge_logit=el.detach().cpu(),
             backend="greedy",
-            prefer_spanner_only=True,
             allow_off_spanner_patch=True,
             greedy_refine_max_n=warm_start_refine_max_n,
             greedy_fallback_max_n=warm_start_fallback_max_n,
@@ -805,8 +706,8 @@ def run_twopass_guided_instance(
         num_nodes=int(data_dev.pos.shape[0]),
         edge_index=data_dev.spanner_edge_index.detach().cpu(),
         edge_logit=el.detach().cpu(),
-        logit_scale=1e3,
-        top_k=int(guided_top_k),
+        logit_scale=float(guided_config.logit_scale),
+        top_k=int(guided_config.top_k),
     )
     timing["candidate_construction_sec"] = time.perf_counter() - cand_t0
 
@@ -820,6 +721,7 @@ def run_twopass_guided_instance(
         num_runs=int(lkh_runs),
         seed=1234,
         timeout=lkh_timeout,
+        guided_config=guided_config,
     )
     timing["lkh_setup_io_sec"] = float(lkh_break.get("lkh_setup_io_sec", 0.0))
     timing["lkh_search_sec"] = float(lkh_break.get("lkh_search_sec", 0.0))
@@ -937,7 +839,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--lkh_exe", type=str, default=default_lkh_executable())
     parser.add_argument("--lkh_runs", type=int, default=1)
     parser.add_argument("--lkh_timeout", type=float, default=0.0)
-    parser.add_argument("--guided_top_k", type=int, default=20)
+    add_guided_lkh_args(parser)
     parser.add_argument("--num_workers", type=int, default=1, help="workers used by the spanner builder and optional baselines")
     parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
     parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
@@ -949,12 +851,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--run_tag", type=str, default=None)
 
     parser.add_argument("--dp_max_used", type=int, default=4)
-    parser.add_argument("--dp_topk", type=int, default=5)
     parser.add_argument("--dp_max_sigma", type=int, default=0)
     parser.add_argument("--dp_child_catalog_cap", type=int, default=0)
     parser.add_argument("--dp_fallback_exact", type=parse_bool_arg, default=True)
     parser.add_argument("--dp_leaf_workers", type=int, default=16)
-    parser.add_argument("--dp_parse_mode", type=str, default="catalog_enum", choices=("catalog_enum", "heuristic"))
 
     args = parser.parse_args(argv)
 
@@ -965,6 +865,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         parser.error("--onepass_ckpt and --twopass_ckpt are required unless --list_instance_presets is used")
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     lkh_exe = resolve_lkh_executable(str(args.lkh_exe))
     lkh_timeout = None if float(args.lkh_timeout) <= 0 else float(args.lkh_timeout)
     print(f"[env] device={device}")
@@ -975,10 +876,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         ckpt_path=str(args.onepass_ckpt),
         device=device,
         r=int(args.r),
-        default_matching_max_used=int(args.dp_max_used),
     )
-    if not onepass_bundle.merge_decoder_loaded:
-        print("[warn] 1-pass checkpoint has no merge_decoder; results will be invalid.")
 
     print(f"[ckpt] loading 2-pass from {args.twopass_ckpt}")
     twopass_bundle = load_twopass_eval_models(
@@ -990,6 +888,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     onepass_packer = NodeTokenPacker(
         r=int(args.r),
         state_mode="matching",
+        iface_order=str(onepass_bundle.iface_order),
         matching_max_used=onepass_bundle.matching_max_used,
     )
     twopass_packer = NodeTokenPacker(
@@ -1005,12 +904,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     onepass_runner = OnePassDPRunner(
         r=int(args.r),
         max_used=onepass_bundle.matching_max_used,
-        topk=int(args.dp_topk),
         max_sigma_enumerate=int(args.dp_max_sigma),
         max_child_catalog_states=int(args.dp_child_catalog_cap),
         fallback_exact=bool(args.dp_fallback_exact),
         num_leaf_workers=int(args.dp_leaf_workers),
-        parse_mode=str(args.dp_parse_mode),
     )
     bu_runner = BottomUpTreeRunner()
     td_runner = TopDownTreeRunner()
@@ -1084,7 +981,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         "lkh_exe": str(lkh_exe),
         "lkh_runs": int(args.lkh_runs),
         "lkh_timeout": (None if lkh_timeout is None else float(lkh_timeout)),
-        "guided_top_k": int(args.guided_top_k),
+        "guided_lkh": {
+            "top_k": int(guided_config.top_k),
+            "logit_scale": float(guided_config.logit_scale),
+            "subgradient": bool(guided_config.subgradient),
+            "max_candidates": guided_config.max_candidates,
+            "max_trials": guided_config.max_trials,
+            "use_initial_tour": bool(guided_config.use_initial_tour),
+        },
         "use_iface_in_decode": bool(args.use_iface_in_decode),
         "spanner_mode": str(args.spanner_mode),
         "theta_k": int(args.theta_k),
@@ -1159,7 +1063,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             bu_runner=bu_runner,
             td_runner=td_runner,
             use_iface_in_decode=bool(args.use_iface_in_decode),
-            guided_top_k=int(args.guided_top_k),
+            guided_config=guided_config,
             lkh_exe=lkh_exe,
             lkh_runs=int(args.lkh_runs),
             lkh_timeout=lkh_timeout,

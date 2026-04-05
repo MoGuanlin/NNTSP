@@ -334,7 +334,7 @@ def main() -> None:
     # top-down
     from src.models.top_down_decoder import TopDownDecoder
     from src.models.top_down_runner import TopDownTreeRunner
-    from src.models.edge_aggregation import aggregate_cross_logits_to_edges
+    from src.models.edge_aggregation import aggregate_logits_to_edges
 
     obj = _torch_load(args.data_pt, map_location="cpu")
     if isinstance(obj, list):
@@ -407,7 +407,7 @@ def main() -> None:
     _cross_eid_uniqueness_sanity(tokens)
 
     # Edge aggregation
-    edge_scores = aggregate_cross_logits_to_edges(tokens=tokens, cross_logit=out_td.cross_logit)
+    edge_scores = aggregate_logits_to_edges(tokens=tokens, cross_logit=out_td.cross_logit)
     edge_logit = edge_scores.edge_logit
     edge_mask = edge_scores.edge_mask
     if edge_logit.numel() > 0:

@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 from .dp_correspondence import CorrespondenceMaps, propagate_c1_constraints
 from .dp_verify import verify_tuple
@@ -52,6 +53,68 @@ def _rank_child_catalog_states_for_parse(
     return valid_indices[sort_order]
 
 
+def _rank_child_catalog_states_for_parse_iface_mate(
+    *,
+    iface_scores_q: Tensor,
+    mate_scores_q: Tensor,
+    child_iface_mask_q: Tensor,
+    constrained_q: Tensor,
+    required_q: Tensor,
+    cat_used: Tensor,
+    cat_mate: Tensor,
+    child_cost_q: Tensor,
+    max_child_states: Optional[int] = None,
+    lambda_mate: float = 1.0,
+) -> Tensor:
+    """Return child-state indices ranked by iface + mate compatibility."""
+    finite_mask = child_cost_q < float("inf")
+    if constrained_q.any():
+        state_vals = cat_used[:, constrained_q].bool()
+        required_vals = required_q[constrained_q].unsqueeze(0)
+        c1_match = (state_vals == required_vals).all(dim=1)
+        valid_mask = c1_match & finite_mask
+    else:
+        valid_mask = finite_mask
+
+    valid_indices = valid_mask.nonzero(as_tuple=False).flatten()
+    if valid_indices.numel() == 0:
+        return valid_indices
+
+    valid_used = cat_used[valid_indices].bool()
+    valid_mate = cat_mate[valid_indices].long()
+    slot_mask = child_iface_mask_q.bool().unsqueeze(0)
+
+    pos = F.logsigmoid(iface_scores_q).unsqueeze(0)
+    neg = F.logsigmoid(-iface_scores_q).unsqueeze(0)
+    iface_term = torch.where(valid_used, pos, neg)
+    iface_term = (iface_term * slot_mask.float()).sum(dim=1)
+
+    state_scores = iface_term
+    lam = float(lambda_mate)
+    if lam != 0.0:
+        Ti = int(iface_scores_q.shape[0])
+        slot_ids = torch.arange(Ti, device=iface_scores_q.device, dtype=torch.long).unsqueeze(0)
+        mate_clamped = valid_mate.clamp(min=0)
+        gathered = mate_scores_q[slot_ids.expand_as(mate_clamped), mate_clamped]
+        pair_mask = (
+            valid_used
+            & slot_mask
+            & (valid_mate >= 0)
+            & (slot_ids < valid_mate)
+        )
+        mate_term = (gathered * pair_mask.float()).sum(dim=1)
+        state_scores = state_scores + lam * mate_term
+
+    if max_child_states is not None:
+        cap = int(max_child_states)
+        if cap > 0 and valid_indices.numel() > cap:
+            top_pos = torch.topk(state_scores, k=cap, largest=True, sorted=True).indices
+            return valid_indices[top_pos]
+
+    sort_order = state_scores.argsort(descending=True)
+    return valid_indices[sort_order]
+
+
 def parse_by_catalog_enum(
     *,
     scores: Tensor,
@@ -64,9 +127,14 @@ def parse_by_catalog_enum(
     cat_used: Tensor,
     cat_mate: Tensor,
     child_costs: List[Optional[Tensor]],
+    mate_scores: Optional[Tensor] = None,
+    ranking_mode: str = "iface",
+    lambda_mate: float = 1.0,
     max_child_states: Optional[int] = None,
 ) -> Tuple[float, Tuple[int, int, int, int]]:
     """Catalog-enumeration PARSE."""
+    if ranking_mode not in ("iface", "iface_mate"):
+        raise ValueError(f"ranking_mode must be 'iface' or 'iface_mate', got {ranking_mode!r}")
     Ti = int(parent_a.shape[0])
     device = parent_a.device
 
@@ -87,15 +155,31 @@ def parse_by_catalog_enum(
             child_valid_states.append([])
             continue
 
-        ranked_indices = _rank_child_catalog_states_for_parse(
-            scores_q=scores[q],
-            child_iface_mask_q=child_iface_mask[q],
-            constrained_q=c1_constrained[q],
-            required_q=c1_required[q],
-            cat_used=cat_used,
-            child_cost_q=child_costs[q],
-            max_child_states=max_child_states,
-        )
+        if ranking_mode == "iface_mate":
+            if mate_scores is None:
+                raise ValueError("mate_scores must be provided when ranking_mode='iface_mate'")
+            ranked_indices = _rank_child_catalog_states_for_parse_iface_mate(
+                iface_scores_q=scores[q],
+                mate_scores_q=mate_scores[q],
+                child_iface_mask_q=child_iface_mask[q],
+                constrained_q=c1_constrained[q],
+                required_q=c1_required[q],
+                cat_used=cat_used,
+                cat_mate=cat_mate,
+                child_cost_q=child_costs[q],
+                max_child_states=max_child_states,
+                lambda_mate=lambda_mate,
+            )
+        else:
+            ranked_indices = _rank_child_catalog_states_for_parse(
+                scores_q=scores[q],
+                child_iface_mask_q=child_iface_mask[q],
+                constrained_q=c1_constrained[q],
+                required_q=c1_required[q],
+                cat_used=cat_used,
+                child_cost_q=child_costs[q],
+                max_child_states=max_child_states,
+            )
         if ranked_indices.numel() == 0:
             return float("inf"), (-1, -1, -1, -1)
         child_valid_states.append(ranked_indices.tolist())
@@ -177,4 +261,8 @@ def parse_by_catalog_enum(
     return best_cost, best_indices
 
 
-__all__ = ["_rank_child_catalog_states_for_parse", "parse_by_catalog_enum"]
+__all__ = [
+    "_rank_child_catalog_states_for_parse",
+    "_rank_child_catalog_states_for_parse_iface_mate",
+    "parse_by_catalog_enum",
+]

@@ -18,10 +18,19 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.onepass_trainer import OnePassTrainRunner, OnePassTrainResult, onepass_loss
+from src.models.onepass_trainer import (
+    OnePassTrainRunner,
+    OnePassTrainResult,
+    build_child_mate_targets_from_structured_states,
+    build_child_mate_targets_from_states,
+    onepass_loss,
+)
 from src.models.merge_decoder import MergeDecoder
 from src.models.bc_state_catalog import build_boundary_state_catalog
-from src.models.labeler import _build_matching_target_for_node
+from src.models.labeler import (
+    _build_matching_target_for_node,
+    _build_matching_target_for_node_structured,
+)
 
 
 # ─── Stub encoders ───────────────────────────────────────────────────────────
@@ -189,6 +198,145 @@ def test_forward_pass_shape():
     print(f"  decode_mask: {result.decode_mask}")
 
 
+def test_forward_pass_shape_iface_mate():
+    """iface_mate decoder should emit mate logits for decoded internal nodes."""
+    Ti, Tc, P, d = 8, 4, 4, 64
+    M = 5
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    leaf_enc = StubLeafEncoder(d)
+    merge_enc = StubMergeEncoder(d)
+    merge_dec = MergeDecoder(
+        d_model=d,
+        n_heads=4,
+        num_iface_slots=Ti,
+        decoder_variant="iface_mate",
+        parent_num_layers=2,
+        cross_num_layers=1,
+        max_depth=16,
+    )
+
+    catalog = build_boundary_state_catalog(num_slots=Ti, max_used=4, device=torch.device("cpu"))
+    target_state_idx = torch.full((M,), -1, dtype=torch.long)
+    m_state = torch.zeros(M, dtype=torch.bool)
+    target_state_idx[0] = 0
+    m_state[0] = True
+
+    runner = OnePassTrainRunner()
+    result = runner.run_single(
+        tokens=tokens, leaves=leaves,
+        leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
+        catalog=catalog,
+        target_state_idx=target_state_idx, m_state=m_state,
+    )
+
+    assert result.child_mate_scores is not None
+    assert result.child_mate_scores.shape == (M, 4, Ti, Ti)
+
+
+def test_forward_pass_shape_direct_structured():
+    """Direct structured supervision should decode from raw (used, mate) labels."""
+    Ti, Tc, P, d = 8, 4, 4, 64
+    M = 5
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    leaf_enc = StubLeafEncoder(d)
+    merge_enc = StubMergeEncoder(d)
+    merge_dec = MergeDecoder(
+        d_model=d,
+        n_heads=4,
+        num_iface_slots=Ti,
+        decoder_variant="iface_mate",
+        parent_num_layers=2,
+        cross_num_layers=1,
+        max_depth=16,
+    )
+
+    parent_sigma_used = torch.zeros((M, Ti), dtype=torch.bool)
+    parent_sigma_mate = torch.full((M, Ti), -1, dtype=torch.long)
+    m_parent_sigma = torch.zeros(M, dtype=torch.bool)
+    parent_sigma_used[0, 0] = True
+    parent_sigma_used[0, 1] = True
+    parent_sigma_mate[0, 0] = 1
+    parent_sigma_mate[0, 1] = 0
+    m_parent_sigma[0] = True
+
+    runner = OnePassTrainRunner()
+    result = runner.run_single(
+        tokens=tokens,
+        leaves=leaves,
+        leaf_encoder=leaf_enc,
+        merge_encoder=merge_enc,
+        merge_decoder=merge_dec,
+        catalog=None,
+        parent_sigma_used=parent_sigma_used,
+        parent_sigma_mate=parent_sigma_mate,
+        m_state=m_parent_sigma,
+        supervision_mode="direct_structured",
+    )
+
+    assert isinstance(result, OnePassTrainResult)
+    assert result.child_scores.shape == (M, 4, Ti)
+    assert result.child_mate_scores is not None
+    assert result.decode_mask[0].item() is True
+
+
+def test_build_child_mate_targets_from_structured_states():
+    Ti, Tc, P = 8, 4, 4
+    M = 5
+    tokens, _ = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    parent_sigma_used = torch.zeros((M, Ti), dtype=torch.bool)
+    parent_sigma_mate = torch.full((M, Ti), -1, dtype=torch.long)
+    m_parent_sigma = torch.zeros(M, dtype=torch.bool)
+
+    parent_sigma_used[1, 0] = True
+    parent_sigma_used[1, 1] = True
+    parent_sigma_mate[1, 0] = 1
+    parent_sigma_mate[1, 1] = 0
+    m_parent_sigma[1] = True
+
+    m_child_iface = torch.ones((M, 4, Ti), dtype=torch.bool)
+    y_child_mate, m_child_mate = build_child_mate_targets_from_structured_states(
+        tree_children_index=tokens.tree_children_index,
+        m_child_iface=m_child_iface,
+        parent_sigma_used=parent_sigma_used,
+        parent_sigma_mate=parent_sigma_mate,
+        m_parent_sigma_structured=m_parent_sigma,
+    )
+
+    assert m_child_mate[0, 0, 0].item() is True
+    assert m_child_mate[0, 0, 1].item() is True
+    assert y_child_mate[0, 0, 0].item() == 1
+    assert y_child_mate[0, 0, 1].item() == 0
+
+
+def test_structured_matching_helper_is_not_capped_by_max_used():
+    Ti = 8
+    iface_mask = torch.ones(Ti, dtype=torch.bool)
+    iface_eid = torch.arange(Ti, dtype=torch.long)
+    iface_inside_ep = torch.tensor([0, 0, 0, 0, 0, 0, 0, 0], dtype=torch.long)
+    points_in_node = {0, 1, 2, 3}
+    selected_local_eids = {0, 1, 2, 3, 4, 5}
+    sp_u = [0, 0, 1, 1, 2, 2, 9, 9]
+    sp_v = [4, 5, 6, 7, 8, 9, 10, 11]
+
+    used, mate, structured_exact = _build_matching_target_for_node_structured(
+        local_node_id=0,
+        points_in_node=points_in_node,
+        selected_local_eids=selected_local_eids,
+        sp_u=sp_u,
+        sp_v=sp_v,
+        iface_eid_row=iface_eid,
+        iface_mask_row=iface_mask,
+        iface_inside_ep_row=iface_inside_ep,
+    )
+
+    assert int(used.sum().item()) == 6
+    assert structured_exact is True
+    assert mate.shape == (Ti,)
+
+
 def test_gradient_flows():
     """Gradients should flow through the full 1-pass pipeline."""
     Ti, Tc, P, d = 8, 4, 4, 64
@@ -251,6 +399,49 @@ def test_gradient_flows():
 
     print(f"  Gradient flow: {has_grad}")
     assert has_grad["merge_dec"], "MergeDecoder must have gradients"
+
+
+def test_onepass_loss_with_mate_targets() -> None:
+    Ti = 8
+    M = 5
+    tokens, _ = build_synthetic_tree(Ti=Ti, Tc=4, P=4)
+    catalog = build_boundary_state_catalog(num_slots=Ti, max_used=4, device=torch.device("cpu"))
+
+    target_state_idx = torch.full((M,), -1, dtype=torch.long)
+    child_state_mask = torch.zeros(M, dtype=torch.bool)
+    non_empty_state = int(torch.nonzero(catalog.used_iface.any(dim=1), as_tuple=False)[0].item())
+    target_state_idx[1:] = non_empty_state
+    child_state_mask[1:] = True
+    m_child_iface = torch.ones(M, 4, Ti, dtype=torch.bool)
+
+    y_child_iface = torch.zeros(M, 4, Ti)
+    child_scores = torch.zeros(M, 4, Ti, requires_grad=True)
+    child_mate_scores = torch.zeros(M, 4, Ti, Ti, requires_grad=True)
+    decode_mask = torch.zeros(M, dtype=torch.bool)
+    decode_mask[0] = True
+
+    y_child_mate, m_child_mate = build_child_mate_targets_from_states(
+        tree_children_index=tokens.tree_children_index,
+        m_child_iface=m_child_iface,
+        target_state_idx=target_state_idx,
+        child_state_mask=child_state_mask,
+        state_used_iface=catalog.used_iface,
+        state_mate=catalog.mate,
+    )
+
+    loss = onepass_loss(
+        child_scores=child_scores,
+        decode_mask=decode_mask,
+        y_child_iface=y_child_iface,
+        m_child_iface=m_child_iface,
+        child_mate_scores=child_mate_scores,
+        y_child_mate=y_child_mate,
+        m_child_mate=m_child_mate,
+        mate_weight=1.0,
+    )
+    assert torch.isfinite(loss).item()
+    loss.backward()
+    assert child_mate_scores.grad is not None
     # Note: leaf_enc and merge_enc may or may not have gradients depending on
     # whether their outputs influence the loss through z_node in parent_memory
 

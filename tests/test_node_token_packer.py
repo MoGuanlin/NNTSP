@@ -17,7 +17,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models.node_token_packer import _stable_sort_interfaces
+from src.models.boundary_state_structured import (
+    enumerate_structured_states_for_iface_mask,
+    state_to_tensors,
+)
+from src.models.node_token_packer import NodeTokenPacker, _stable_sort_interfaces
 
 
 class TestStableSortInterfaces:
@@ -65,6 +69,82 @@ class TestStableSortInterfaces:
         #   -> BOTTOM right -> BOTTOM left -> LEFT lower -> LEFT upper
         assert sorted_dir.tolist() == [3, 3, 1, 1, 2, 2, 0, 0]
         assert sorted_eid.tolist() == [20, 70, 30, 40, 80, 10, 60, 50]
+
+    def test_iface_mode_can_force_clockwise_order(self):
+        """Structured one-pass DP must be able to use clockwise slot order."""
+        legacy_packer = NodeTokenPacker(r=4, state_mode="iface", iface_order="legacy")
+        fixed_packer = NodeTokenPacker(r=4, state_mode="iface", iface_order="clockwise")
+        matching_packer = NodeTokenPacker(r=4, state_mode="matching", iface_order="legacy")
+
+        assert legacy_packer._use_clockwise_iface_order() is False
+        assert fixed_packer._use_clockwise_iface_order() is True
+        assert matching_packer._use_clockwise_iface_order() is True
+
+    def test_legacy_iface_order_misses_clockwise_legal_pairing(self):
+        """Legacy iface ordering should not be used for structured non-crossing states."""
+        iface_nid = torch.zeros(4, dtype=torch.long)
+        iface_eid = torch.tensor([100, 200, 300, 400], dtype=torch.long)  # L, R, B, T
+        iface_dir = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+        iface_inside_ep = torch.zeros(4, dtype=torch.long)
+        iface_inside_quad = torch.zeros(4, dtype=torch.long)
+        iface_feat6 = torch.zeros(4, 6, dtype=torch.float32)
+        iface_feat6[0, 3] = 0.8   # LEFT upper
+        iface_feat6[1, 3] = 0.7   # RIGHT upper
+        iface_feat6[2, 2] = 0.2   # BOTTOM right
+        iface_feat6[3, 2] = -0.2  # TOP left
+
+        _, legacy_eid, _, _, _, _ = _stable_sort_interfaces(
+            iface_nid=iface_nid,
+            iface_eid=iface_eid,
+            iface_feat6=iface_feat6,
+            iface_dir=iface_dir,
+            iface_inside_ep=iface_inside_ep,
+            iface_inside_quad=iface_inside_quad,
+            clockwise=False,
+        )
+        _, clockwise_eid, _, _, _, _ = _stable_sort_interfaces(
+            iface_nid=iface_nid,
+            iface_eid=iface_eid,
+            iface_feat6=iface_feat6,
+            iface_dir=iface_dir,
+            iface_inside_ep=iface_inside_ep,
+            iface_inside_quad=iface_inside_quad,
+            clockwise=True,
+        )
+
+        states = enumerate_structured_states_for_iface_mask(
+            iface_mask=torch.ones(4, dtype=torch.bool)
+        )
+
+        def pairing_sets(slot_eids: torch.Tensor) -> set[frozenset[frozenset[int]]]:
+            pairings = set()
+            for state in states:
+                used, mate = state_to_tensors(state=state, num_slots=4)
+                edges = []
+                for slot in range(4):
+                    mate_slot = int(mate[slot].item())
+                    if not bool(used[slot].item()) or mate_slot < slot:
+                        continue
+                    edges.append(
+                        frozenset(
+                            {
+                                int(slot_eids[slot].item()),
+                                int(slot_eids[mate_slot].item()),
+                            }
+                        )
+                    )
+                pairings.add(frozenset(edges))
+            return pairings
+
+        target_pairing = frozenset(
+            {
+                frozenset({400, 200}),  # TOP-RIGHT
+                frozenset({300, 100}),  # BOTTOM-LEFT
+            }
+        )
+
+        assert target_pairing in pairing_sets(clockwise_eid)
+        assert target_pairing not in pairing_sets(legacy_eid)
 
 
 def run_all_tests():

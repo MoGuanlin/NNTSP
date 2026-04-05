@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from src.cli.common import load_dataset
 from src.cli.model_factory import load_twopass_eval_models
-from src.models.labeler import PseudoLabeler
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 from src.utils.lkh_solver import default_lkh_executable
 
 
@@ -268,7 +268,7 @@ def _teacher_timing_worker(args_tuple):
 def time_teacher_generation(
     *,
     data_pt: str,
-    labeler: PseudoLabeler,
+    labeler: Any,
     sample_idx: int,
     sample_idx_end: Optional[int],
     num_workers: int,
@@ -418,8 +418,13 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--teacher_sample_idx", type=int, default=0, help="teacher timing start sample index")
     parser.add_argument("--teacher_sample_idx_end", type=int, default=None, help="teacher timing end sample index (exclusive); omit to time the full dataset")
     parser.add_argument("--teacher_num_workers", type=int, default=None, help="workers for teacher timing; defaults to the checkpoint training num_workers")
-    parser.add_argument("--teacher_lkh_runs", type=int, default=None, help="override teacher LKH runs; default comes from checkpoint args")
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=None, help="override teacher LKH timeout in seconds")
+    add_teacher_lkh_args(
+        parser,
+        runs_default=None,
+        timeout_default=None,
+        runs_help="override teacher LKH runs; default comes from checkpoint args",
+        timeout_help="override teacher LKH timeout in seconds",
+    )
     parser.add_argument("--lkh_exe", type=str, default=default_lkh_executable(), help="path to LKH executable for teacher timing")
     parser.add_argument("--num_gpus_override", type=int, default=None, help="override the GPU count used for GPU-hour calculation")
     parser.add_argument("--output_dir", type=str, default="outputs/eval_training_cost", help="directory for report artifacts")
@@ -541,22 +546,14 @@ def main(argv: List[str] | None = None) -> None:
                 if args.teacher_num_workers is not None
                 else int(ckpt_args.get("num_workers", 0))
             )
-            labeler = PseudoLabeler(
-                two_opt_passes=int(ckpt_args.get("two_opt_passes", 30)),
-                use_lkh=bool(ckpt_args.get("use_lkh", False)),
+            labeler = build_spanner_teacher_labeler(
                 lkh_exe=str(args.lkh_exe),
+                config=teacher_lkh_config_from_args(
+                    args,
+                    runs_default=int(ckpt_args.get("teacher_lkh_runs", 1)),
+                    timeout_default=ckpt_args.get("teacher_lkh_timeout", 0.0),
+                ),
                 prefer_cpu=True,
-                teacher_mode="spanner_lkh",
-                teacher_lkh_runs=int(
-                    args.teacher_lkh_runs
-                    if args.teacher_lkh_runs is not None
-                    else ckpt_args.get("teacher_lkh_runs", 1)
-                ),
-                teacher_lkh_timeout=(
-                    None
-                    if args.teacher_lkh_timeout is None
-                    else (None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout))
-                ),
             )
             teacher_report = time_teacher_generation(
                 data_pt=str(teacher_data_pt),

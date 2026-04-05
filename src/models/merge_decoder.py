@@ -57,8 +57,12 @@ class MergeDecoderOutput:
 
     child_scores: [B_sigma, 4, Ti] float — per-child, per-slot activation logits
                   (apply sigmoid to get probabilities)
+    child_mate_scores: optional [B_sigma, 4, Ti, Ti] float — per-child mate
+                  logits for "slot s prefers mate t"; only populated when the
+                  decoder is built in `iface_mate` mode.
     """
     child_scores: Tensor
+    child_mate_scores: Optional[Tensor] = None
 
 
 class SigmaEncoder(nn.Module):
@@ -174,11 +178,11 @@ class CrossAttentionBlock(nn.Module):
         return q
 
 
-class MergeDecoderModule(nn.Module):
+class MergeDecoder(nn.Module):
     """Sigma-conditioned decoder for the 1-pass DP merge step.
 
     Usage pattern:
-        decoder = MergeDecoderModule(...)
+        decoder = MergeDecoder(...)
 
         # 1) Build parent memory once per box
         mem = decoder.build_parent_memory(
@@ -202,6 +206,7 @@ class MergeDecoderModule(nn.Module):
         d_model: int = 128,
         n_heads: int = 8,
         num_iface_slots: int = 16,
+        decoder_variant: str = "iface",
         parent_num_layers: int = 3,
         cross_num_layers: int = 2,
         attn_dropout: float = 0.0,
@@ -213,6 +218,11 @@ class MergeDecoderModule(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.num_iface_slots = num_iface_slots
+        self.decoder_variant = str(decoder_variant)
+        if self.decoder_variant not in ("iface", "iface_mate"):
+            raise ValueError(
+                f"decoder_variant must be 'iface' or 'iface_mate', got {self.decoder_variant!r}"
+            )
 
         # --- Parent memory construction ---
         # Tokenizer for CLS + IFACE + CROSS + CHILD
@@ -270,6 +280,16 @@ class MergeDecoderModule(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 4 * num_iface_slots),
         )
+        self.child_mate_head: Optional[nn.Module]
+        if self.decoder_variant == "iface_mate":
+            self.child_mate_head = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, 4 * num_iface_slots * num_iface_slots),
+            )
+        else:
+            self.child_mate_head = None
 
     def build_parent_memory(
         self,
@@ -385,7 +405,18 @@ class MergeDecoderModule(nn.Module):
         neg_inf = torch.tensor(-1e9, device=child_scores.device, dtype=child_scores.dtype)
         child_scores = torch.where(child_iface_mask.bool(), child_scores, neg_inf)
 
-        return MergeDecoderOutput(child_scores=child_scores)
+        child_mate_scores: Optional[Tensor] = None
+        if self.child_mate_head is not None:
+            mate_raw = self.child_mate_head(q).view(B_sigma, 4, Ti, Ti)
+            src_mask = child_iface_mask.bool().unsqueeze(-1)
+            dst_mask = child_iface_mask.bool().unsqueeze(-2)
+            mate_mask = src_mask & dst_mask
+            child_mate_scores = torch.where(mate_mask, mate_raw, neg_inf)
+
+        return MergeDecoderOutput(
+            child_scores=child_scores,
+            child_mate_scores=child_mate_scores,
+        )
 
     def decode_sigma_chunked(
         self,
@@ -413,6 +444,7 @@ class MergeDecoderModule(nn.Module):
             )
 
         chunk_outputs = []
+        chunk_mate_outputs = []
         chunk_size = int(max_batch_size)
         for start in range(0, B_sigma, chunk_size):
             end = min(start + chunk_size, B_sigma)
@@ -429,8 +461,17 @@ class MergeDecoderModule(nn.Module):
                 child_iface_mask=child_iface_mask[start:end],
             )
             chunk_outputs.append(out.child_scores)
+            if out.child_mate_scores is not None:
+                chunk_mate_outputs.append(out.child_mate_scores)
 
-        return MergeDecoderOutput(child_scores=torch.cat(chunk_outputs, dim=0))
+        return MergeDecoderOutput(
+            child_scores=torch.cat(chunk_outputs, dim=0),
+            child_mate_scores=(
+                torch.cat(chunk_mate_outputs, dim=0)
+                if chunk_mate_outputs
+                else None
+            ),
+        )
 
     def decode_sigma_batch(
         self,
@@ -478,6 +519,4 @@ class MergeDecoderModule(nn.Module):
         )
 
 
-# Public alias
-MergeDecoder = MergeDecoderModule
-__all__ = ["MergeDecoder", "MergeDecoderModule", "MergeDecoderOutput", "ParentMemory"]
+__all__ = ["MergeDecoder", "MergeDecoderOutput", "ParentMemory"]

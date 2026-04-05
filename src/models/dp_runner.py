@@ -30,11 +30,11 @@ or replace any existing 2-pass code (BottomUpTreeRunner, TopDownTreeRunner, etc.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import multiprocessing as mp
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Use 'spawn' context to avoid CUDA + fork() deadlocks.
 # After CUDA is initialized in the parent, fork() inherits a broken
@@ -45,6 +45,12 @@ import torch
 from torch import Tensor
 
 from .bc_state_catalog import BoundaryStateCatalog, build_boundary_state_catalog, state_mask_from_iface_mask
+from .boundary_state_structured import (
+    StructuredBoundaryState,
+    build_state_index,
+    enumerate_structured_states_for_iface_mask,
+    stack_state_tensors,
+)
 from .dp_core import (
     CorrespondenceMaps,
     batch_check_c1c2,
@@ -57,6 +63,13 @@ from .dp_core import (
     verify_tuple,
 )
 from .dp_fallback import exact_fallback, lookup_child_costs
+from .dp_leaf_solver_structured import leaf_exact_solve_structured
+from .dp_parse_factorized import (
+    parse_by_factorized_widening,
+    prepare_factorized_child_rankings,
+    rank_parent_states_by_child_lower_bound,
+    solve_factorized_widening_from_ranked_child_states,
+)
 from .dp_stats import (
     bump_stat,
     ensure_depth_stats_bucket,
@@ -91,6 +104,99 @@ def _leaf_solve_worker(args):
     )
 
 
+def _leaf_solve_structured_worker(args):
+    """Worker function for parallel structured leaf exact solve."""
+    (points_xy, point_mask, iface_mask, iface_feat6, box_xy, is_root) = args
+    costs, state_list, state_used, state_mate, _state_index = leaf_exact_solve_structured(
+        points_xy=points_xy,
+        point_mask=point_mask,
+        iface_mask=iface_mask,
+        iface_feat6=iface_feat6,
+        box_xy=box_xy,
+        is_root=is_root,
+    )
+    return costs, state_list, state_used, state_mate
+
+
+def _factorized_node_parse_worker(args):
+    """CPU worker for factorized ranking prep + exact widening on one chunk."""
+    (
+        candidate_indices,
+        decode_scores,
+        decode_mate_scores,
+        parent_iface_mask,
+        child_iface_mask,
+        child_exists,
+        maps,
+        child_tables,
+        state_used,
+        state_mate,
+        widening_schedule,
+        ranking_mode,
+        lambda_mate,
+        fallback_exact,
+    ) = args
+    solved_costs: Dict[int, float] = {}
+    backptr: Dict[int, Tuple[int, int, int, int]] = {}
+    outcome_counts: Dict[str, float] = {}
+    prep_sec = 0.0
+    solve_sec = 0.0
+    num_rank_failed = 0
+
+    for local_idx, si in enumerate(candidate_indices):
+        t_prep = time.time()
+        ranked_child_states, status = prepare_factorized_child_rankings(
+            scores=decode_scores[local_idx],
+            mate_scores=(
+                decode_mate_scores[local_idx]
+                if decode_mate_scores is not None
+                else None
+            ),
+            parent_a=state_used[int(si)],
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask=child_iface_mask,
+            child_exists=child_exists,
+            maps=maps,
+            child_tables=child_tables,
+            ranking_mode=ranking_mode,
+            lambda_mate=lambda_mate,
+        )
+        prep_sec += float(time.time() - t_prep)
+
+        if status != "ok" or ranked_child_states is None:
+            num_rank_failed += 1
+            outcome_counts["num_infeasible"] = float(outcome_counts.get("num_infeasible", 0.0) + 1.0)
+            continue
+
+        t_solve = time.time()
+        cost, child_si, outcome_key = solve_factorized_widening_from_ranked_child_states(
+            ranked_child_states=ranked_child_states,
+            parent_a=state_used[int(si)],
+            parent_mate=state_mate[int(si)],
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask=child_iface_mask,
+            child_exists=child_exists,
+            maps=maps,
+            child_tables=child_tables,
+            widening_schedule=widening_schedule,
+            fallback_exact=fallback_exact,
+        )
+        solve_sec += float(time.time() - t_solve)
+        if cost < float("inf"):
+            solved_costs[int(si)] = float(cost)
+            backptr[int(si)] = child_si
+            outcome_counts[outcome_key] = float(outcome_counts.get(outcome_key, 0.0) + 1.0)
+        else:
+            outcome_counts["num_infeasible"] = float(outcome_counts.get("num_infeasible", 0.0) + 1.0)
+
+    return solved_costs, backptr, outcome_counts, {
+        "num_candidates": int(len(candidate_indices)),
+        "num_rank_failed": int(num_rank_failed),
+        "prep_sec": float(prep_sec),
+        "solve_sec": float(solve_sec),
+    }
+
+
 # ─── Data Structures ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -102,6 +208,10 @@ class CostTableEntry:
     """
     costs: Tensor               # [S] float
     backptr: Dict[int, Tuple[int, int, int, int]]  # sigma_idx -> (s1, s2, s3, s4) child state indices
+    state_list: Optional[List[StructuredBoundaryState]] = None
+    state_used_iface: Optional[Tensor] = None  # [S, Ti] bool, node-local structured states
+    state_mate: Optional[Tensor] = None        # [S, Ti] long, node-local structured states
+    state_index: Optional[Dict[StructuredBoundaryState, int]] = None
 
 
 @dataclass
@@ -135,7 +245,7 @@ class OnePassDPRunner:
     """1-Pass bottom-up DP runner with sigma-conditioned neural merge.
 
     Usage:
-        runner = OnePassDPRunner(r=4, max_used=4, topk=5)
+        runner = OnePassDPRunner(r=4, max_used=4)
         result = runner.run_single(
             tokens=..., leaves=...,
             leaf_encoder=..., merge_encoder=..., merge_decoder=...,
@@ -157,12 +267,15 @@ class OnePassDPRunner:
         max_child_catalog_states: Optional[int] = None,
         fallback_exact: bool = True,
         num_leaf_workers: int = 0,
+        num_parse_workers: int = 0,
         parse_mode: str = "catalog_enum",
+        catalog_mate_lambda: float = 1.0,
+        child_catalog_widening: Optional[Union[Iterable[int], str]] = None,
         max_decode_batch_size: Optional[int] = 60000,
     ) -> None:
         self.r = r
         self.max_used = max_used
-        self.topk = topk
+        self.topk = int(topk)
         if max_sigma_enumerate is None:
             self.max_sigma_enumerate = None
         else:
@@ -175,14 +288,82 @@ class OnePassDPRunner:
             self.max_child_catalog_states = cap if cap > 0 else None
         self.fallback_exact = fallback_exact
         self.num_leaf_workers = num_leaf_workers
+        self.num_parse_workers = max(0, int(num_parse_workers))
         if max_decode_batch_size is None:
             self.max_decode_batch_size = None
         else:
             cap = int(max_decode_batch_size)
             self.max_decode_batch_size = cap if cap > 0 else None
-        if parse_mode not in ("catalog_enum", "heuristic"):
-            raise ValueError(f"parse_mode must be 'catalog_enum' or 'heuristic', got '{parse_mode}'")
-        self.parse_mode = parse_mode
+        if parse_mode not in (
+            "catalog_enum",
+            "catalog_enum_iface_mate",
+            "catalog_widening",
+            "catalog_widening_iface_mate",
+            "factorized_widening",
+            "factorized_widening_iface_mate",
+            "heuristic",
+        ):
+            raise ValueError(
+                "parse_mode must be 'catalog_enum', 'catalog_enum_iface_mate', "
+                "'catalog_widening', 'catalog_widening_iface_mate', "
+                "'factorized_widening', 'factorized_widening_iface_mate' or 'heuristic', "
+                f"got '{parse_mode}'"
+            )
+        self.parse_mode = str(parse_mode)
+        self.catalog_mate_lambda = float(catalog_mate_lambda)
+        self.child_catalog_widening = self._normalize_widening_schedule(child_catalog_widening)
+
+    @staticmethod
+    def _normalize_widening_schedule(
+        schedule: Optional[Union[Iterable[int], str]],
+    ) -> Tuple[int, ...]:
+        """Parse a widening schedule from iterable or comma-separated CLI text."""
+        if schedule is None:
+            return ()
+        if isinstance(schedule, str):
+            text = schedule.strip()
+            if text == "" or text.lower() in {"none", "off", "disabled"}:
+                return ()
+            raw_values = [chunk.strip() for chunk in text.split(",")]
+        else:
+            raw_values = list(schedule)
+
+        normalized: List[int] = []
+        seen = set()
+        for raw in raw_values:
+            if raw is None:
+                continue
+            value = int(raw)
+            if value <= 0 or value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+        normalized.sort()
+        return tuple(normalized)
+
+    def _effective_catalog_widening_schedule(self) -> Tuple[int, ...]:
+        """Return the widening caps used by catalog_widening modes."""
+        if self.child_catalog_widening:
+            return self.child_catalog_widening
+        if self.max_child_catalog_states is not None:
+            base = max(1, int(self.max_child_catalog_states))
+        else:
+            base = 8
+        schedule = []
+        cap = base
+        for _ in range(4):
+            schedule.append(cap)
+            cap *= 2
+        return self._normalize_widening_schedule(schedule)
+
+    def _is_factorized_mode(self) -> bool:
+        return self.parse_mode in ("factorized_widening", "factorized_widening_iface_mate")
+
+    def _decode_iface_uses_logits(self) -> bool:
+        """Return whether the current parse mode expects raw iface logits."""
+        if self._is_factorized_mode():
+            return True
+        return self.parse_mode in ("catalog_enum_iface_mate", "catalog_widening_iface_mate")
 
     def _apply_sigma_cap(self, candidate_indices: Tensor) -> Tensor:
         """Apply an explicit heuristic sigma cap.
@@ -230,21 +411,29 @@ class OnePassDPRunner:
         total_M = int(tokens.tree_parent_index.numel())
         Ti = int(tokens.iface_mask.shape[1])
         tokens_cpu = make_cpu_token_cache(tokens)
+        structured_mode = self._is_factorized_mode()
 
         # Build catalog if not provided
-        if catalog is None:
+        if (not structured_mode) and catalog is None:
             catalog = build_boundary_state_catalog(
                 num_slots=Ti, max_used=self.max_used, device=device,
             )
-        S = int(catalog.used_iface.shape[0])
-        cat_used_cpu = catalog.used_iface.detach().cpu()
-        cat_mate_cpu = catalog.mate.detach().cpu()
+        if structured_mode:
+            S = -1
+            cat_used_cpu = None
+            cat_mate_cpu = None
+            node_state_mask = None
+        else:
+            assert catalog is not None
+            S = int(catalog.used_iface.shape[0])
+            cat_used_cpu = catalog.used_iface.detach().cpu()
+            cat_mate_cpu = catalog.mate.detach().cpu()
 
-        # Per-node valid state mask
-        node_state_mask = state_mask_from_iface_mask(
-            iface_mask=tokens_cpu.iface_mask,
-            state_used_iface=cat_used_cpu,
-        )  # [M, S]
+            # Per-node valid state mask
+            node_state_mask = state_mask_from_iface_mask(
+                iface_mask=tokens_cpu.iface_mask,
+                state_used_iface=cat_used_cpu,
+            )  # [M, S]
 
         # Storage
         cost_tables: Dict[int, CostTableEntry] = {}
@@ -263,7 +452,9 @@ class OnePassDPRunner:
             "num_leaves": 0.0,
             "num_internal": 0.0,
             "num_sigma_total": 0.0,
+            "num_sigma_pruned_lb": 0.0,
             "num_parse_ok": 0.0,
+            "num_widening_ok": 0.0,
             "num_topk_ok": 0.0,
             "num_fallback": 0.0,
             "num_infeasible": 0.0,
@@ -284,7 +475,7 @@ class OnePassDPRunner:
 
         # ─── Bottom-up traversal ─────────────────────────────────────────
         t_start = time.time()
-        print(f"  [dp] total_M={total_M}, max_depth={max_depth}, S={S}, Ti={Ti}")
+        print(f"  [dp] total_M={total_M}, max_depth={max_depth}, S={S}, Ti={Ti}, structured={structured_mode}")
         for d in range(max_depth, -1, -1):
             nids_at_d = torch.nonzero(depth == d, as_tuple=False).flatten()
             if nids_at_d.numel() == 0:
@@ -315,49 +506,93 @@ class OnePassDPRunner:
                 stats["leaf_encode_sec"] += float(t_enc - leaf_stage_t0)
                 print(f"    [leaf] encode {leaf_nids.numel()} leaves: {t_enc - t_depth:.2f}s")
 
-                # Prepare args for leaf_exact_solve (all on CPU for efficiency)
-                cat_used_cpu = catalog.used_iface.cpu()
-                cat_mate_cpu = catalog.mate.cpu()
-                leaf_args_list = []
                 leaf_nid_list = []
-                for nid_t in leaf_nids:
-                    nid = int(nid_t.item())
-                    row = int(leaf_row_for_node[nid].item())
-                    leaf_nid_list.append(nid)
-                    leaf_args_list.append((
-                        leaves.point_xy[row].cpu(),
-                        leaves.point_mask[row].cpu(),
-                        tokens_cpu.iface_eid[nid],
-                        tokens_cpu.iface_mask[nid],
-                        tokens_cpu.iface_boundary_dir[nid],
-                        tokens_cpu.iface_feat6[nid],
-                        cat_used_cpu,
-                        cat_mate_cpu,
-                        node_state_mask[nid],
-                        tokens_cpu.tree_node_feat_rel[nid],
-                        nid == root_id,
-                    ))
-
-                num_w = self.num_leaf_workers
-                num_leaves_d = len(leaf_nid_list)
+                num_leaves_d = int(leaf_nids.numel())
                 leaf_exact_t0 = time.time()
-                if num_w > 0 and num_leaves_d > 1:
-                    # Parallel leaf exact solve
-                    print(f"    [leaf] exact_solve {num_leaves_d} leaves with {num_w} workers...")
-                    with ProcessPoolExecutor(max_workers=num_w, mp_context=_MP_CTX) as pool:
-                        results = list(pool.map(_leaf_solve_worker, leaf_args_list))
-                    for nid, costs in zip(leaf_nid_list, results):
-                        cost_tables[nid] = CostTableEntry(costs=costs.cpu(), backptr={})
-                        stats["num_leaves"] += 1
-                    print(f"    [leaf] exact_solve {num_leaves_d}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
+                if structured_mode:
+                    leaf_args_list = []
+                    for nid_t in leaf_nids:
+                        nid = int(nid_t.item())
+                        row = int(leaf_row_for_node[nid].item())
+                        leaf_nid_list.append(nid)
+                        leaf_args_list.append((
+                            leaves.point_xy[row].cpu(),
+                            leaves.point_mask[row].cpu(),
+                            tokens_cpu.iface_mask[nid],
+                            tokens_cpu.iface_feat6[nid],
+                            tokens_cpu.tree_node_feat_rel[nid],
+                            nid == root_id,
+                        ))
+                    num_w = self.num_leaf_workers
+                    if num_w > 0 and num_leaves_d > 1:
+                        print(f"    [leaf] structured_exact_solve {num_leaves_d} leaves with {num_w} workers...")
+                        with ProcessPoolExecutor(max_workers=num_w, mp_context=_MP_CTX) as pool:
+                            results = list(pool.map(_leaf_solve_structured_worker, leaf_args_list))
+                        for nid, (costs, state_list, state_used, state_mate) in zip(leaf_nid_list, results):
+                            cost_tables[nid] = CostTableEntry(
+                                costs=costs.cpu(),
+                                backptr={},
+                                state_list=state_list,
+                                state_used_iface=state_used.cpu(),
+                                state_mate=state_mate.cpu(),
+                                state_index=build_state_index(state_list),
+                            )
+                            stats["num_leaves"] += 1
+                        print(f"    [leaf] structured_exact_solve {num_leaves_d}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
+                    else:
+                        for li, (nid, args) in enumerate(zip(leaf_nid_list, leaf_args_list)):
+                            costs, state_list, state_used, state_mate = _leaf_solve_structured_worker(args)
+                            cost_tables[nid] = CostTableEntry(
+                                costs=costs.cpu(),
+                                backptr={},
+                                state_list=state_list,
+                                state_used_iface=state_used.cpu(),
+                                state_mate=state_mate.cpu(),
+                                state_index=build_state_index(state_list),
+                            )
+                            stats["num_leaves"] += 1
+                            if (li + 1) % 50 == 0 or (li + 1) == num_leaves_d:
+                                print(f"    [leaf] structured_exact_solve {li+1}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
                 else:
-                    # Sequential fallback
-                    for li, (nid, args) in enumerate(zip(leaf_nid_list, leaf_args_list)):
-                        costs = _leaf_solve_worker(args)
-                        cost_tables[nid] = CostTableEntry(costs=costs.cpu(), backptr={})
-                        stats["num_leaves"] += 1
-                        if (li + 1) % 50 == 0 or (li + 1) == num_leaves_d:
-                            print(f"    [leaf] exact_solve {li+1}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
+                    # Prepare args for leaf_exact_solve (all on CPU for efficiency)
+                    assert catalog is not None and cat_used_cpu is not None and cat_mate_cpu is not None and node_state_mask is not None
+                    leaf_args_list = []
+                    for nid_t in leaf_nids:
+                        nid = int(nid_t.item())
+                        row = int(leaf_row_for_node[nid].item())
+                        leaf_nid_list.append(nid)
+                        leaf_args_list.append((
+                            leaves.point_xy[row].cpu(),
+                            leaves.point_mask[row].cpu(),
+                            tokens_cpu.iface_eid[nid],
+                            tokens_cpu.iface_mask[nid],
+                            tokens_cpu.iface_boundary_dir[nid],
+                            tokens_cpu.iface_feat6[nid],
+                            cat_used_cpu,
+                            cat_mate_cpu,
+                            node_state_mask[nid],
+                            tokens_cpu.tree_node_feat_rel[nid],
+                            nid == root_id,
+                        ))
+
+                    num_w = self.num_leaf_workers
+                    if num_w > 0 and num_leaves_d > 1:
+                        # Parallel leaf exact solve
+                        print(f"    [leaf] exact_solve {num_leaves_d} leaves with {num_w} workers...")
+                        with ProcessPoolExecutor(max_workers=num_w, mp_context=_MP_CTX) as pool:
+                            results = list(pool.map(_leaf_solve_worker, leaf_args_list))
+                        for nid, costs in zip(leaf_nid_list, results):
+                            cost_tables[nid] = CostTableEntry(costs=costs.cpu(), backptr={})
+                            stats["num_leaves"] += 1
+                        print(f"    [leaf] exact_solve {num_leaves_d}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
+                    else:
+                        # Sequential fallback
+                        for li, (nid, args) in enumerate(zip(leaf_nid_list, leaf_args_list)):
+                            costs = _leaf_solve_worker(args)
+                            cost_tables[nid] = CostTableEntry(costs=costs.cpu(), backptr={})
+                            stats["num_leaves"] += 1
+                            if (li + 1) % 50 == 0 or (li + 1) == num_leaves_d:
+                                print(f"    [leaf] exact_solve {li+1}/{num_leaves_d} done ({time.time()-t_enc:.1f}s)")
                 stats["leaf_exact_sec"] += float(time.time() - leaf_exact_t0)
 
                 computed[leaf_nids] = True
@@ -411,8 +646,8 @@ class OnePassDPRunner:
 
                 # ── Batched decode: collect all candidates from ALL nodes,
                 #    one GPU forward pass ──────────────────────────────────
-                cat_used_dev = catalog.used_iface.to(device)
-                cat_mate_dev = catalog.mate.to(device)
+                cat_used_dev = catalog.used_iface.to(device) if (catalog is not None and not structured_mode) else None
+                cat_mate_dev = catalog.mate.to(device) if (catalog is not None and not structured_mode) else None
 
                 per_node_info = []   # [(nid, candidates, maps, child_iface_mask_4, child_iface_bdir, children, child_exists)]
                 all_sigma_a = []
@@ -443,20 +678,69 @@ class OnePassDPRunner:
                     child_iface_bdir_n = tokens_cpu.iface_boundary_dir[ch_clamped_n]
                     parent_iface_mask_n = tokens_cpu.iface_mask[nid].bool()
 
-                    # Get + pre-filter candidates
-                    valid_mask = node_state_mask[nid]
-                    cands = torch.nonzero(valid_mask, as_tuple=False).flatten()
-                    has_child = maps_n.phi_out_child >= 0
-                    unmapped = parent_iface_mask_n & ~has_child
-                    if unmapped.any() and cands.numel() > 0:
-                        c1_pre = ~(cat_used_cpu[cands].bool() & unmapped.unsqueeze(0)).any(dim=1)
-                        cands = cands[c1_pre]
-                    cands = self._apply_sigma_cap(cands)
-
-                    per_node_info.append((
-                        nid, cands, maps_n, child_iface_mask_4,
-                        child_iface_bdir_n, children_n, child_exists_n,
-                    ))
+                    if structured_mode:
+                        state_list_n = enumerate_structured_states_for_iface_mask(
+                            iface_mask=tokens_cpu.iface_mask[nid].bool()
+                        )
+                        state_used_n_cpu, state_mate_n_cpu = stack_state_tensors(
+                            states=state_list_n,
+                            num_slots=Ti,
+                            device=torch.device("cpu"),
+                        )
+                        cands = torch.arange(len(state_list_n), dtype=torch.long)
+                        has_child = maps_n.phi_out_child >= 0
+                        unmapped = parent_iface_mask_n & ~has_child
+                        if unmapped.any() and cands.numel() > 0:
+                            c1_pre = ~(state_used_n_cpu[cands].bool() & unmapped.unsqueeze(0)).any(dim=1)
+                            cands = cands[c1_pre]
+                        child_tables_n: List[Optional[CostTableEntry]] = [None] * 4
+                        for q in range(4):
+                            if not child_exists_n[q].item():
+                                continue
+                            cid = int(children_n[q].item())
+                            child_tables_n[q] = cost_tables.get(cid)
+                        if cands.numel() > 0:
+                            ordered_local_indices, _ = rank_parent_states_by_child_lower_bound(
+                                parent_state_used=state_used_n_cpu[cands],
+                                parent_iface_mask=parent_iface_mask_n,
+                                child_iface_mask=child_iface_mask_4,
+                                child_exists=child_exists_n,
+                                maps=maps_n,
+                                child_tables=child_tables_n,
+                            )
+                            pruned_lb = int(cands.numel()) - int(len(ordered_local_indices))
+                            if pruned_lb > 0:
+                                bump_stat(
+                                    stats,
+                                    "num_sigma_pruned_lb",
+                                    amount=float(pruned_lb),
+                                    depth_bucket=depth_bucket,
+                                )
+                            if ordered_local_indices:
+                                reorder = torch.tensor(ordered_local_indices, dtype=torch.long)
+                                cands = cands[reorder]
+                            else:
+                                cands = cands[:0]
+                        cands = self._apply_sigma_cap(cands)
+                        per_node_info.append((
+                            nid, cands, maps_n, child_iface_mask_4, child_iface_bdir_n,
+                            children_n, child_exists_n, state_list_n, state_used_n_cpu, state_mate_n_cpu,
+                        ))
+                    else:
+                        assert node_state_mask is not None and cat_used_cpu is not None
+                        # Get + pre-filter candidates
+                        valid_mask = node_state_mask[nid]
+                        cands = torch.nonzero(valid_mask, as_tuple=False).flatten()
+                        has_child = maps_n.phi_out_child >= 0
+                        unmapped = parent_iface_mask_n & ~has_child
+                        if unmapped.any() and cands.numel() > 0:
+                            c1_pre = ~(cat_used_cpu[cands].bool() & unmapped.unsqueeze(0)).any(dim=1)
+                            cands = cands[c1_pre]
+                        cands = self._apply_sigma_cap(cands)
+                        per_node_info.append((
+                            nid, cands, maps_n, child_iface_mask_4, child_iface_bdir_n,
+                            children_n, child_exists_n, None, None, None,
+                        ))
 
                     K_i = cands.numel()
                     bump_stat(
@@ -467,8 +751,16 @@ class OnePassDPRunner:
                     )
                     if K_i > 0:
                         cands_dev = cands.to(device=device, dtype=torch.long)
-                        all_sigma_a.append(cat_used_dev[cands_dev].float())
-                        all_sigma_mate.append(cat_mate_dev[cands_dev])
+                        if structured_mode:
+                            assert per_node_info[-1][8] is not None and per_node_info[-1][9] is not None
+                            state_used_n_dev = per_node_info[-1][8].to(device=device)
+                            state_mate_n_dev = per_node_info[-1][9].to(device=device)
+                            all_sigma_a.append(state_used_n_dev[cands_dev].float())
+                            all_sigma_mate.append(state_mate_n_dev[cands_dev])
+                        else:
+                            assert cat_used_dev is not None and cat_mate_dev is not None
+                            all_sigma_a.append(cat_used_dev[cands_dev].float())
+                            all_sigma_mate.append(cat_mate_dev[cands_dev])
                         all_iface_mask.append(
                             parent_iface_mask_n.to(device=device).unsqueeze(0).expand(K_i, -1)
                         )
@@ -479,7 +771,9 @@ class OnePassDPRunner:
 
                 # One big GPU decode
                 K_total = sum(repeat_counts)
-                all_decode_scores = None
+                all_decode_logits = None
+                all_decode_probs = None
+                all_decode_mate_scores = None
                 if K_total > 0:
                     big_sigma_a = torch.cat(all_sigma_a)           # [K_total, Ti]
                     big_sigma_mate = torch.cat(all_sigma_mate)     # [K_total, Ti]
@@ -507,7 +801,10 @@ class OnePassDPRunner:
                         child_iface_mask=big_child_mask.bool(),
                         max_batch_size=self.max_decode_batch_size,
                     )
-                    all_decode_scores = torch.sigmoid(out.child_scores).cpu()  # [K_total, 4, Ti]
+                    all_decode_logits = out.child_scores  # [K_total, 4, Ti]
+                    all_decode_probs = torch.sigmoid(out.child_scores)  # [K_total, 4, Ti]
+                    if out.child_mate_scores is not None:
+                        all_decode_mate_scores = out.child_mate_scores  # [K_total, 4, Ti, Ti]
 
                 t_decode = time.time()
                 stats["decode_sec"] += float(t_decode - t_mem)
@@ -516,37 +813,231 @@ class OnePassDPRunner:
                 # ── Per-node: PARSE + VERIFY + fallback (CPU-bound) ──
                 merge_dp_t0 = time.time()
                 offset = 0
-                for idx, (nid, cands, maps_n, child_iface_mask_4,
-                          child_iface_bdir_n, children_n, child_exists_n) in enumerate(per_node_info):
-                    K_i = repeat_counts[idx]
-                    node_scores = all_decode_scores[offset:offset+K_i] if K_i > 0 else None
-                    offset += K_i
+                if structured_mode and self.num_parse_workers > 0 and K_total > 0:
+                    ranking_mode = "iface_mate" if self.parse_mode.endswith("iface_mate") else "iface"
+                    if ranking_mode == "iface_mate" and all_decode_mate_scores is None:
+                        raise ValueError(
+                            f"parse_mode='{self.parse_mode}' requires decoder outputs with mate scores"
+                        )
+                    schedule = self._effective_catalog_widening_schedule()
+                    target_jobs = max(self.num_parse_workers, self.num_parse_workers * 4)
+                    chunk_size = max(1, (K_total + target_jobs - 1) // target_jobs)
+                    total_chunks = 0
+                    worker_specs = []
+                    node_accumulators: Dict[int, Dict[str, Any]] = {}
 
-                    self._process_internal_node_post_decode(
-                        nid=nid, tokens=tokens_cpu,
-                        candidate_indices=cands,
-                        decode_scores=node_scores,
-                        maps=maps_n,
-                        child_iface_mask_4=child_iface_mask_4,
-                        child_iface_bdir=child_iface_bdir_n,
-                        children=children_n,
-                        child_exists=child_exists_n,
-                        catalog=catalog,
-                        cat_used_dev=cat_used_cpu,
-                        cat_mate_dev=cat_mate_cpu,
-                        node_state_mask=node_state_mask,
-                        cost_tables=cost_tables,
-                        stats=stats,
-                        depth_bucket=depth_bucket,
-                    )
-                    stats["num_internal"] += 1
-                    ct = cost_tables[nid]
-                    n_feasible = int((ct.costs < float("inf")).sum().item())
-                    print(
-                        f"    [internal] DP {idx+1}/{N_int} "
-                        f"nid={nid} feasible={n_feasible}/{int(node_state_mask[nid].sum().item())} "
-                        f"({time.time() - t_decode:.1f}s)"
-                    )
+                    def _finalize_parallel_structured_node(nid: int) -> None:
+                        acc = node_accumulators[nid]
+                        self._store_structured_cost_table(
+                            nid=nid,
+                            state_list=acc["state_list"],
+                            state_used=acc["state_used"],
+                            state_mate=acc["state_mate"],
+                            costs=acc["costs"],
+                            backptr=acc["backptr"],
+                            cost_tables=cost_tables,
+                        )
+                        stats["num_internal"] += 1
+                        ct = cost_tables[nid]
+                        feasible_mask = ct.costs < float("inf")
+                        n_feasible = int(feasible_mask.sum().item())
+                        denom = int(ct.costs.numel())
+                        print(
+                            f"    [internal] DP {acc['node_idx']+1}/{N_int} "
+                            f"nid={nid} feasible={n_feasible}/{denom} "
+                            f"prep={acc['prep_sec']:.2f}s solve={acc['solve_sec']:.2f}s "
+                            f"rank_failed={acc['num_rank_failed']} "
+                            f"({time.time() - t_decode:.1f}s)"
+                        )
+
+                    for idx, (nid, cands, maps_n, child_iface_mask_4,
+                              child_iface_bdir_n, children_n, child_exists_n,
+                              state_list_n, state_used_n_cpu, state_mate_n_cpu) in enumerate(per_node_info):
+                        K_i = repeat_counts[idx]
+                        node_scores_cpu = None
+                        if K_i > 0:
+                            source = all_decode_logits if self._decode_iface_uses_logits() else all_decode_probs
+                            node_scores_cpu = source[offset:offset+K_i].detach().cpu()
+                        node_mate_scores_cpu = (
+                            all_decode_mate_scores[offset:offset+K_i].detach().cpu()
+                            if (K_i > 0 and all_decode_mate_scores is not None)
+                            else None
+                        )
+                        offset += K_i
+                        assert state_list_n is not None and state_used_n_cpu is not None and state_mate_n_cpu is not None
+
+                        node_accumulators[nid] = {
+                            "node_idx": idx,
+                            "state_list": state_list_n,
+                            "state_used": state_used_n_cpu.cpu(),
+                            "state_mate": state_mate_n_cpu.cpu(),
+                            "costs": torch.full(
+                                (int(len(state_list_n)),),
+                                float("inf"),
+                                dtype=torch.float32,
+                                device=torch.device("cpu"),
+                            ),
+                            "backptr": {},
+                            "num_pending_chunks": 0,
+                            "num_rank_failed": 0,
+                            "prep_sec": 0.0,
+                            "solve_sec": 0.0,
+                        }
+
+                        child_tables_n: List[Optional[CostTableEntry]] = [None] * 4
+                        for q in range(4):
+                            if not child_exists_n[q].item():
+                                continue
+                            cid = int(children_n[q].item())
+                            child_tables_n[q] = cost_tables.get(cid)
+
+                        if K_i > 0:
+                            for start in range(0, K_i, chunk_size):
+                                end = min(K_i, start + chunk_size)
+                                chunk_candidates = [int(v) for v in cands[start:end].tolist()]
+                                worker_specs.append((
+                                    (
+                                        chunk_candidates,
+                                        node_scores_cpu[start:end],
+                                        (
+                                            node_mate_scores_cpu[start:end]
+                                            if node_mate_scores_cpu is not None
+                                            else None
+                                        ),
+                                        tokens_cpu.iface_mask[nid].bool().cpu(),
+                                        child_iface_mask_4.cpu(),
+                                        child_exists_n.cpu(),
+                                        maps_n,
+                                        child_tables_n,
+                                        state_used_n_cpu.cpu(),
+                                        state_mate_n_cpu.cpu(),
+                                        schedule,
+                                        ranking_mode,
+                                        self.catalog_mate_lambda,
+                                        self.fallback_exact,
+                                    ),
+                                    {
+                                        "nid": nid,
+                                        "node_idx": idx,
+                                        "chunk_idx": total_chunks,
+                                    },
+                                ))
+                                node_accumulators[nid]["num_pending_chunks"] += 1
+                                total_chunks += 1
+                        else:
+                            _finalize_parallel_structured_node(nid)
+
+                    if worker_specs:
+                        print(
+                            f"    [internal] factorized prep+solve: "
+                            f"{N_int} nodes, {K_total} sigmas, workers={self.num_parse_workers}, "
+                            f"chunks={total_chunks}, chunk_size~{chunk_size}"
+                        )
+                        with ProcessPoolExecutor(max_workers=self.num_parse_workers, mp_context=_MP_CTX) as pool:
+                            futures = {
+                                pool.submit(_factorized_node_parse_worker, args): meta
+                                for args, meta in worker_specs
+                            }
+                            completed_chunks = 0
+                            for future in as_completed(futures):
+                                meta = futures[future]
+                                nid = int(meta["nid"])
+                                costs_n, backptr_n, outcome_counts, worker_stats = future.result()
+                                acc = node_accumulators[nid]
+                                for si, cost in costs_n.items():
+                                    acc["costs"][int(si)] = float(cost)
+                                acc["backptr"].update(backptr_n)
+                                acc["num_rank_failed"] += int(worker_stats["num_rank_failed"])
+                                acc["prep_sec"] += float(worker_stats["prep_sec"])
+                                acc["solve_sec"] += float(worker_stats["solve_sec"])
+                                acc["num_pending_chunks"] -= 1
+
+                                completed_chunks += 1
+                                print(
+                                    f"      [factorized] chunk {completed_chunks}/{total_chunks} "
+                                    f"nid={nid} sigmas={int(worker_stats['num_candidates'])} "
+                                    f"prep={float(worker_stats['prep_sec']):.2f}s "
+                                    f"solve={float(worker_stats['solve_sec']):.2f}s "
+                                    f"rank_failed={int(worker_stats['num_rank_failed'])} "
+                                    f"({time.time() - t_decode:.1f}s)"
+                                )
+
+                                if acc["num_pending_chunks"] == 0:
+                                    _finalize_parallel_structured_node(nid)
+                                for key, amount in outcome_counts.items():
+                                    bump_stat(stats, key, amount=float(amount), depth_bucket=depth_bucket)
+                else:
+                    for idx, (nid, cands, maps_n, child_iface_mask_4,
+                              child_iface_bdir_n, children_n, child_exists_n,
+                              state_list_n, state_used_n_cpu, state_mate_n_cpu) in enumerate(per_node_info):
+                        K_i = repeat_counts[idx]
+                        node_scores = None
+                        if K_i > 0:
+                            source = all_decode_logits if self._decode_iface_uses_logits() else all_decode_probs
+                            node_scores = source[offset:offset+K_i]
+                        node_mate_scores = all_decode_mate_scores[offset:offset+K_i] if (K_i > 0 and all_decode_mate_scores is not None) else None
+                        offset += K_i
+
+                        if structured_mode:
+                            assert state_list_n is not None and state_used_n_cpu is not None and state_mate_n_cpu is not None
+                            factorized_summary = self._process_internal_node_post_decode_factorized(
+                                nid=nid,
+                                tokens=tokens_cpu,
+                                candidate_indices=cands,
+                                decode_scores=node_scores,
+                                decode_mate_scores=node_mate_scores,
+                                maps=maps_n,
+                                child_iface_mask_4=child_iface_mask_4,
+                                child_iface_bdir=child_iface_bdir_n,
+                                children=children_n,
+                                child_exists=child_exists_n,
+                                state_list=state_list_n,
+                                state_used=state_used_n_cpu,
+                                state_mate=state_mate_n_cpu,
+                                cost_tables=cost_tables,
+                                stats=stats,
+                                depth_bucket=depth_bucket,
+                            )
+                        else:
+                            assert catalog is not None and cat_used_cpu is not None and cat_mate_cpu is not None and node_state_mask is not None
+                            self._process_internal_node_post_decode(
+                                nid=nid, tokens=tokens_cpu,
+                                candidate_indices=cands,
+                                decode_scores=node_scores,
+                                decode_mate_scores=node_mate_scores,
+                                maps=maps_n,
+                                child_iface_mask_4=child_iface_mask_4,
+                                child_iface_bdir=child_iface_bdir_n,
+                                children=children_n,
+                                child_exists=child_exists_n,
+                                catalog=catalog,
+                                cat_used_dev=cat_used_cpu,
+                                cat_mate_dev=cat_mate_cpu,
+                                node_state_mask=node_state_mask,
+                                cost_tables=cost_tables,
+                                stats=stats,
+                                depth_bucket=depth_bucket,
+                            )
+                        stats["num_internal"] += 1
+                        ct = cost_tables[nid]
+                        feasible_mask = ct.costs < float("inf")
+                        n_feasible = int(feasible_mask.sum().item())
+                        denom = int(ct.costs.numel())
+                        if structured_mode:
+                            print(
+                                f"    [internal] DP {idx+1}/{N_int} "
+                                f"nid={nid} feasible={n_feasible}/{denom} "
+                                f"prep={factorized_summary['prep_sec']:.2f}s "
+                                f"solve={factorized_summary['solve_sec']:.2f}s "
+                                f"rank_failed={int(factorized_summary['num_rank_failed'])} "
+                                f"({time.time() - t_decode:.1f}s)"
+                            )
+                        else:
+                            print(
+                                f"    [internal] DP {idx+1}/{N_int} "
+                                f"nid={nid} feasible={n_feasible}/{denom} "
+                                f"({time.time() - t_decode:.1f}s)"
+                            )
 
                 computed[internal_nids] = True
                 stats["merge_dp_sec"] += float(time.time() - merge_dp_t0)
@@ -571,7 +1062,9 @@ class OnePassDPRunner:
             )
 
         valid_costs = root_ct.costs.clone()
-        valid_costs[~node_state_mask[root_id]] = float("inf")
+        if not structured_mode:
+            assert node_state_mask is not None
+            valid_costs[~node_state_mask[root_id]] = float("inf")
         best_sigma = int(valid_costs.argmin().item())
         best_cost_norm = float(valid_costs[best_sigma].item())
 
@@ -638,6 +1131,7 @@ class OnePassDPRunner:
         tokens: PackedNodeTokens,
         candidate_indices: Tensor,
         decode_scores: Optional[Tensor],   # [K, 4, Ti] sigmoid scores, or None
+        decode_mate_scores: Optional[Tensor],  # [K, 4, Ti, Ti] mate logits, or None
         maps: CorrespondenceMaps,
         child_iface_mask_4: Tensor,
         child_iface_bdir: Tensor,
@@ -673,35 +1167,62 @@ class OnePassDPRunner:
                 if ct is not None:
                     child_cost_list[q] = ct.costs
 
-            if self.parse_mode == "catalog_enum":
-                # ── Catalog-enumeration PARSE: direct enumeration with neural guidance ──
+            if self.parse_mode in (
+                "catalog_enum",
+                "catalog_enum_iface_mate",
+                "catalog_widening",
+                "catalog_widening_iface_mate",
+            ):
+                # Catalog-enumeration PARSE: direct enumeration with neural guidance.
+                ranking_mode = "iface_mate" if self.parse_mode.endswith("iface_mate") else "iface"
+                if ranking_mode == "iface_mate" and decode_mate_scores is None:
+                    raise ValueError(
+                        f"parse_mode='{self.parse_mode}' requires decoder outputs with mate scores"
+                    )
                 for k_idx in range(K):
                     si = int(candidate_indices[k_idx].item())
                     if costs[si] < float("inf"):
                         continue
 
-                    cost, child_si, used_fallback = self._parse_catalog_enum_with_optional_fallback(
-                        scores=decode_scores[k_idx],
-                        parent_a=cat_used_dev[si],
-                        parent_mate=cat_mate_dev[si],
-                        parent_iface_mask=parent_iface_mask,
-                        child_iface_mask=child_iface_mask_4,
-                        child_exists=child_exists,
-                        maps=maps,
-                        cat_used=cat_used_dev,
-                        cat_mate=cat_mate_dev,
-                        child_costs=child_cost_list,
-                    )
+                    if self.parse_mode.startswith("catalog_widening"):
+                        cost, child_si, outcome_key = self._parse_catalog_enum_with_widening(
+                            scores=decode_scores[k_idx],
+                            mate_scores=(decode_mate_scores[k_idx] if decode_mate_scores is not None else None),
+                            parent_a=cat_used_dev[si],
+                            parent_mate=cat_mate_dev[si],
+                            parent_iface_mask=parent_iface_mask,
+                            child_iface_mask=child_iface_mask_4,
+                            child_exists=child_exists,
+                            maps=maps,
+                            cat_used=cat_used_dev,
+                            cat_mate=cat_mate_dev,
+                            child_costs=child_cost_list,
+                            ranking_mode=ranking_mode,
+                        )
+                    else:
+                        cost, child_si, used_fallback = self._parse_catalog_enum_with_optional_fallback(
+                            scores=decode_scores[k_idx],
+                            mate_scores=(decode_mate_scores[k_idx] if decode_mate_scores is not None else None),
+                            parent_a=cat_used_dev[si],
+                            parent_mate=cat_mate_dev[si],
+                            parent_iface_mask=parent_iface_mask,
+                            child_iface_mask=child_iface_mask_4,
+                            child_exists=child_exists,
+                            maps=maps,
+                            cat_used=cat_used_dev,
+                            cat_mate=cat_mate_dev,
+                            child_costs=child_cost_list,
+                            ranking_mode=ranking_mode,
+                        )
+                        outcome_key = "num_fallback" if used_fallback else "num_parse_ok"
                     if cost < float("inf"):
                         costs[si] = cost
                         backptr[si] = child_si
-                        stat_key = "num_fallback" if used_fallback else "num_parse_ok"
-                        bump_stat(stats, stat_key, depth_bucket=depth_bucket)
+                        bump_stat(stats, outcome_key, depth_bucket=depth_bucket)
                     else:
                         bump_stat(stats, "num_infeasible", depth_bucket=depth_bucket)
-
             else:
-                # ── Heuristic PARSE (legacy): threshold rounding + top-K + exact fallback ──
+                # Legacy heuristic PARSE: threshold rounding + top-K + exact fallback.
                 child_a_all = parse_activation_batch(
                     scores_batch=decode_scores,
                     child_iface_mask=child_iface_mask_4,
@@ -732,24 +1253,33 @@ class OnePassDPRunner:
                     scores = decode_scores[k_idx]
 
                     child_a, child_mate = parse_continuous(
-                        scores=scores, child_iface_mask=child_iface_mask_4,
-                        child_iface_bdir=child_iface_bdir, child_exists=child_exists,
-                        maps=maps, r=self.r,
+                        scores=scores,
+                        child_iface_mask=child_iface_mask_4,
+                        child_iface_bdir=child_iface_bdir,
+                        child_exists=child_exists,
+                        maps=maps,
+                        r=self.r,
                         parent_a=parent_a.bool(),
                         parent_iface_mask=parent_iface_mask,
                     )
                     ok = verify_tuple(
-                        parent_a=parent_a.bool(), parent_mate=parent_mate,
+                        parent_a=parent_a.bool(),
+                        parent_mate=parent_mate,
                         parent_iface_mask=parent_iface_mask,
-                        child_a=child_a, child_mate=child_mate,
+                        child_a=child_a,
+                        child_mate=child_mate,
                         child_iface_mask=child_iface_mask_4,
-                        child_exists=child_exists, maps=maps,
+                        child_exists=child_exists,
+                        maps=maps,
                     )
                     if ok:
                         cost, csi = lookup_child_costs(
-                            child_a=child_a, child_mate=child_mate,
-                            children=children, child_exists=child_exists,
-                            cost_tables=cost_tables, catalog=catalog,
+                            child_a=child_a,
+                            child_mate=child_mate,
+                            children=children,
+                            child_exists=child_exists,
+                            cost_tables=cost_tables,
+                            catalog=catalog,
                         )
                         if cost < float("inf"):
                             costs[si] = cost
@@ -758,17 +1288,26 @@ class OnePassDPRunner:
                             continue
 
                     topk_results = parse_continuous_topk(
-                        scores=scores, child_iface_mask=child_iface_mask_4,
-                        child_iface_bdir=child_iface_bdir, child_exists=child_exists,
-                        maps=maps, parent_a=parent_a.bool(), parent_mate=parent_mate,
-                        parent_iface_mask=parent_iface_mask, r=self.r, K=self.topk,
+                        scores=scores,
+                        child_iface_mask=child_iface_mask_4,
+                        child_iface_bdir=child_iface_bdir,
+                        child_exists=child_exists,
+                        maps=maps,
+                        parent_a=parent_a.bool(),
+                        parent_mate=parent_mate,
+                        parent_iface_mask=parent_iface_mask,
+                        r=self.r,
+                        K=self.topk,
                     )
                     found = False
                     for ca_k, cm_k in topk_results:
                         cost, csi = lookup_child_costs(
-                            child_a=ca_k, child_mate=cm_k,
-                            children=children, child_exists=child_exists,
-                            cost_tables=cost_tables, catalog=catalog,
+                            child_a=ca_k,
+                            child_mate=cm_k,
+                            children=children,
+                            child_exists=child_exists,
+                            cost_tables=cost_tables,
+                            catalog=catalog,
                         )
                         if cost < float("inf"):
                             costs[si] = cost
@@ -791,7 +1330,6 @@ class OnePassDPRunner:
                     elif not found:
                         bump_stat(stats, "num_infeasible", depth_bucket=depth_bucket)
 
-                # C1+C2 failures: constraint-propagated exact fallback
                 children_have_costs = all(
                     (not child_exists[q].item()) or
                     (int(children[q].item()) in cost_tables and
@@ -830,6 +1368,7 @@ class OnePassDPRunner:
         self,
         *,
         scores: Tensor,
+        mate_scores: Optional[Tensor] = None,
         parent_a: Tensor,
         parent_mate: Tensor,
         parent_iface_mask: Tensor,
@@ -839,10 +1378,14 @@ class OnePassDPRunner:
         cat_used: Tensor,
         cat_mate: Tensor,
         child_costs: List[Optional[Tensor]],
+        ranking_mode: str = "iface",
     ) -> Tuple[float, Tuple[int, int, int, int], bool]:
         """Run capped catalog_enum first, then exact enumeration if requested."""
         cost, child_si = parse_by_catalog_enum(
             scores=scores,
+            mate_scores=mate_scores,
+            ranking_mode=ranking_mode,
+            lambda_mate=self.catalog_mate_lambda,
             parent_a=parent_a,
             parent_mate=parent_mate,
             parent_iface_mask=parent_iface_mask,
@@ -866,6 +1409,9 @@ class OnePassDPRunner:
 
         exact_cost, exact_child_si = parse_by_catalog_enum(
             scores=scores,
+            mate_scores=mate_scores,
+            ranking_mode=ranking_mode,
+            lambda_mate=self.catalog_mate_lambda,
             parent_a=parent_a,
             parent_mate=parent_mate,
             parent_iface_mask=parent_iface_mask,
@@ -878,5 +1424,276 @@ class OnePassDPRunner:
             max_child_states=None,
         )
         return exact_cost, exact_child_si, exact_cost < float("inf")
+
+    def _prepare_factorized_node_rankings(
+        self,
+        *,
+        candidate_indices: Tensor,
+        decode_scores: Optional[Tensor],
+        decode_mate_scores: Optional[Tensor],
+        parent_iface_mask: Tensor,
+        child_iface_mask_4: Tensor,
+        child_exists: Tensor,
+        maps: CorrespondenceMaps,
+        child_tables: List[Optional[CostTableEntry]],
+        state_used: Tensor,
+    ) -> List[Tuple[int, Optional[List[List[int]]]]]:
+        """Prepare ranked child candidate lists per parent sigma, using GPU when available."""
+        if decode_scores is None or int(candidate_indices.numel()) == 0:
+            return []
+        device = decode_scores.device
+        parent_state_used_dev = state_used.to(device=device, non_blocking=True)
+        parent_iface_mask_dev = parent_iface_mask.to(device=device, non_blocking=True)
+        child_iface_mask_dev = child_iface_mask_4.to(device=device, non_blocking=True)
+        child_exists_dev = child_exists.to(device=device, non_blocking=True)
+        child_state_used_dev: List[Optional[Tensor]] = [None] * 4
+        child_state_mate_dev: List[Optional[Tensor]] = [None] * 4
+        child_cost_dev: List[Optional[Tensor]] = [None] * 4
+        for q in range(4):
+            ct = child_tables[q]
+            if ct is None or ct.state_used_iface is None or ct.state_mate is None or ct.costs is None:
+                continue
+            child_state_used_dev[q] = ct.state_used_iface.to(device=device, non_blocking=True)
+            child_state_mate_dev[q] = ct.state_mate.to(device=device, non_blocking=True)
+            child_cost_dev[q] = ct.costs.to(device=device, non_blocking=True)
+
+        ranking_mode = "iface_mate" if self.parse_mode.endswith("iface_mate") else "iface"
+        prepared: List[Tuple[int, Optional[List[List[int]]]]] = []
+        for k_idx in range(int(candidate_indices.numel())):
+            si = int(candidate_indices[k_idx].item())
+            ranked_child_states, status = prepare_factorized_child_rankings(
+                scores=decode_scores[k_idx],
+                mate_scores=(decode_mate_scores[k_idx] if decode_mate_scores is not None else None),
+                parent_a=parent_state_used_dev[si],
+                parent_iface_mask=parent_iface_mask_dev,
+                child_iface_mask=child_iface_mask_dev,
+                child_exists=child_exists_dev,
+                maps=maps,
+                child_tables=child_tables,
+                ranking_mode=ranking_mode,
+                lambda_mate=self.catalog_mate_lambda,
+                child_state_used_dev=child_state_used_dev,
+                child_state_mate_dev=child_state_mate_dev,
+                child_cost_dev=child_cost_dev,
+            )
+            prepared.append((si, ranked_child_states if status == "ok" else None))
+        return prepared
+
+    def _store_structured_cost_table(
+        self,
+        *,
+        nid: int,
+        state_list: List[StructuredBoundaryState],
+        state_used: Tensor,
+        state_mate: Tensor,
+        costs: Tensor,
+        backptr: Dict[int, Tuple[int, int, int, int]],
+        cost_tables: Dict[int, CostTableEntry],
+    ) -> None:
+        """Store one structured-state DP table on CPU."""
+        cost_tables[nid] = CostTableEntry(
+            costs=costs,
+            backptr=backptr,
+            state_list=state_list,
+            state_used_iface=state_used.cpu(),
+            state_mate=state_mate.cpu(),
+            state_index=build_state_index(state_list),
+        )
+
+    def _process_internal_node_post_decode_factorized(
+        self,
+        *,
+        nid: int,
+        tokens: PackedNodeTokens,
+        candidate_indices: Tensor,
+        decode_scores: Optional[Tensor],
+        decode_mate_scores: Optional[Tensor],
+        maps: CorrespondenceMaps,
+        child_iface_mask_4: Tensor,
+        child_iface_bdir: Tensor,
+        children: Tensor,
+        child_exists: Tensor,
+        state_list: List[StructuredBoundaryState],
+        state_used: Tensor,
+        state_mate: Tensor,
+        cost_tables: Dict[int, CostTableEntry],
+        stats: Dict[str, Any],
+        depth_bucket: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        """Structured-state DP merge without a global capped catalog."""
+        del child_iface_bdir  # reserved for future factorized child generation heuristics
+        parent_iface_mask = tokens.iface_mask[nid].bool()
+        num_states = int(len(state_list))
+        costs = torch.full((num_states,), float("inf"), dtype=torch.float32, device=torch.device("cpu"))
+        backptr: Dict[int, Tuple[int, int, int, int]] = {}
+
+        child_tables: List[Optional[CostTableEntry]] = [None] * 4
+        for q in range(4):
+            if not child_exists[q].item():
+                continue
+            cid = int(children[q].item())
+            child_tables[q] = cost_tables.get(cid)
+
+        ranking_mode = "iface_mate" if self.parse_mode.endswith("iface_mate") else "iface"
+        if ranking_mode == "iface_mate" and candidate_indices.numel() > 0 and decode_mate_scores is None:
+            raise ValueError(
+                f"parse_mode='{self.parse_mode}' requires decoder outputs with mate scores"
+            )
+
+        t_prep = time.time()
+        prepared = self._prepare_factorized_node_rankings(
+            candidate_indices=candidate_indices,
+            decode_scores=decode_scores,
+            decode_mate_scores=decode_mate_scores,
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask_4=child_iface_mask_4,
+            child_exists=child_exists,
+            maps=maps,
+            child_tables=child_tables,
+            state_used=state_used,
+        )
+        prep_sec = float(time.time() - t_prep)
+        num_rank_failed = sum(1 for _, ranked_child_states in prepared if ranked_child_states is None)
+        if prepared:
+            print(
+                f"      [factorized] nid={nid} prep "
+                f"sigmas={len(prepared)} ok={len(prepared) - num_rank_failed} "
+                f"failed={num_rank_failed} ({prep_sec:.2f}s)"
+            )
+
+        schedule = self._effective_catalog_widening_schedule()
+        t_solve = time.time()
+        for si, ranked_child_states in prepared:
+            if costs[si] < float("inf"):
+                continue
+            if ranked_child_states is None:
+                bump_stat(stats, "num_infeasible", depth_bucket=depth_bucket)
+                continue
+            cost, child_si, outcome_key = solve_factorized_widening_from_ranked_child_states(
+                ranked_child_states=ranked_child_states,
+                parent_a=state_used[si],
+                parent_mate=state_mate[si],
+                parent_iface_mask=parent_iface_mask,
+                child_iface_mask=child_iface_mask_4,
+                child_exists=child_exists,
+                maps=maps,
+                child_tables=child_tables,
+                widening_schedule=schedule,
+                fallback_exact=self.fallback_exact,
+            )
+            if cost < float("inf"):
+                costs[si] = float(cost)
+                backptr[si] = child_si
+                bump_stat(stats, outcome_key, depth_bucket=depth_bucket)
+            else:
+                bump_stat(stats, "num_infeasible", depth_bucket=depth_bucket)
+        solve_sec = float(time.time() - t_solve)
+        if prepared:
+            print(
+                f"      [factorized] nid={nid} solve "
+                f"ranked={len(prepared) - num_rank_failed}/{len(prepared)} "
+                f"({solve_sec:.2f}s)"
+            )
+
+        self._store_structured_cost_table(
+            nid=nid,
+            state_list=state_list,
+            state_used=state_used,
+            state_mate=state_mate,
+            costs=costs,
+            backptr=backptr,
+            cost_tables=cost_tables,
+        )
+        return {
+            "prep_sec": prep_sec,
+            "solve_sec": solve_sec,
+            "num_rank_failed": float(num_rank_failed),
+        }
+
+    def _parse_catalog_enum_with_widening(
+        self,
+        *,
+        scores: Tensor,
+        mate_scores: Optional[Tensor] = None,
+        parent_a: Tensor,
+        parent_mate: Tensor,
+        parent_iface_mask: Tensor,
+        child_iface_mask: Tensor,
+        child_exists: Tensor,
+        maps: CorrespondenceMaps,
+        cat_used: Tensor,
+        cat_mate: Tensor,
+        child_costs: List[Optional[Tensor]],
+        ranking_mode: str = "iface",
+    ) -> Tuple[float, Tuple[int, int, int, int], str]:
+        """Run catalog-enum with widening rounds before optional exact fallback."""
+        schedule = list(self._effective_catalog_widening_schedule())
+        if not schedule and self.max_child_catalog_states is not None:
+            schedule = [int(self.max_child_catalog_states)]
+
+        if not schedule:
+            cost, child_si = parse_by_catalog_enum(
+                scores=scores,
+                mate_scores=mate_scores,
+                ranking_mode=ranking_mode,
+                lambda_mate=self.catalog_mate_lambda,
+                parent_a=parent_a,
+                parent_mate=parent_mate,
+                parent_iface_mask=parent_iface_mask,
+                child_iface_mask=child_iface_mask,
+                child_exists=child_exists,
+                maps=maps,
+                cat_used=cat_used,
+                cat_mate=cat_mate,
+                child_costs=child_costs,
+                max_child_states=None,
+            )
+            if cost < float("inf"):
+                return cost, child_si, "num_parse_ok"
+            return cost, child_si, "num_infeasible"
+
+        for attempt_idx, cap in enumerate(schedule):
+            cost, child_si = parse_by_catalog_enum(
+                scores=scores,
+                mate_scores=mate_scores,
+                ranking_mode=ranking_mode,
+                lambda_mate=self.catalog_mate_lambda,
+                parent_a=parent_a,
+                parent_mate=parent_mate,
+                parent_iface_mask=parent_iface_mask,
+                child_iface_mask=child_iface_mask,
+                child_exists=child_exists,
+                maps=maps,
+                cat_used=cat_used,
+                cat_mate=cat_mate,
+                child_costs=child_costs,
+                max_child_states=cap,
+            )
+            if cost < float("inf"):
+                outcome = "num_parse_ok" if attempt_idx == 0 else "num_widening_ok"
+                return cost, child_si, outcome
+
+        if not self.fallback_exact:
+            return float("inf"), (-1, -1, -1, -1), "num_infeasible"
+
+        exact_cost, exact_child_si = parse_by_catalog_enum(
+            scores=scores,
+            mate_scores=mate_scores,
+            ranking_mode=ranking_mode,
+            lambda_mate=self.catalog_mate_lambda,
+            parent_a=parent_a,
+            parent_mate=parent_mate,
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask=child_iface_mask,
+            child_exists=child_exists,
+            maps=maps,
+            cat_used=cat_used,
+            cat_mate=cat_mate,
+            child_costs=child_costs,
+            max_child_states=None,
+        )
+        if exact_cost < float("inf"):
+            return exact_cost, exact_child_si, "num_fallback"
+        return float("inf"), (-1, -1, -1, -1), "num_infeasible"
 
 __all__ = ["OnePassDPRunner", "OnePassDPResult", "CostTableEntry"]

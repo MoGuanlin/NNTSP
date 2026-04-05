@@ -123,7 +123,7 @@ def main() -> None:
     decoder = _instantiate_best_effort(TopDownDecoder, {"r": int(args.r), "d_model": 128}).to(device)
     td = _instantiate_best_effort(TopDownTreeRunner, {})
 
-    labeler = PseudoLabeler(two_opt_passes=30, use_lkh=False, prefer_cpu=True)
+    labeler = PseudoLabeler(prefer_cpu=True)
 
     batch = packer.pack_batch(datas)
     batch = _packed_batch_to_device(batch, device)

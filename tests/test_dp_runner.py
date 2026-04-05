@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.models import dp_runner as dp_runner_mod
 from src.models.dp_runner import OnePassDPRunner, OnePassDPResult
 from src.models.merge_decoder import MergeDecoder
 from src.models.bc_state_catalog import build_boundary_state_catalog
@@ -58,6 +61,76 @@ class StubMergeEncoder(nn.Module):
                 child_z, child_mask):
         B = node_feat_rel.shape[0]
         return self.proj(node_feat_rel)  # [B, d_model]
+
+
+class FixedLogitMergeDecoder:
+    """Deterministic decoder stub for score-domain routing tests."""
+
+    def __init__(self, *, positive: float = 10.0, negative: float = -10.0):
+        self.positive = float(positive)
+        self.negative = float(negative)
+
+    def eval(self):
+        return self
+
+    def build_parent_memory(
+        self,
+        *,
+        node_feat_rel,
+        node_depth,
+        z_node,
+        iface_feat6,
+        iface_mask,
+        iface_boundary_dir,
+        iface_inside_endpoint,
+        iface_inside_quadrant,
+        cross_feat6,
+        cross_mask,
+        cross_child_pair,
+        cross_is_leaf_internal,
+        child_z,
+        child_exists_mask,
+    ):
+        batch = int(node_feat_rel.shape[0])
+        device = node_feat_rel.device
+        return SimpleNamespace(
+            tokens=torch.zeros(batch, 1, 1, dtype=torch.float32, device=device),
+            mask=torch.ones(batch, 1, dtype=torch.bool, device=device),
+            iface_slice=slice(0, 0),
+            cross_slice=slice(0, 0),
+        )
+
+    def decode_sigma_chunked(
+        self,
+        *,
+        sigma_a,
+        sigma_mate,
+        sigma_iface_mask,
+        parent_memory,
+        child_iface_mask,
+        max_batch_size=None,
+    ):
+        del sigma_mate, sigma_iface_mask, parent_memory, max_batch_size
+        batch, _, ti = child_iface_mask.shape
+        child_scores = torch.full(
+            (batch, 4, ti),
+            self.negative,
+            dtype=torch.float32,
+            device=child_iface_mask.device,
+        )
+        child_scores[..., 0] = self.positive
+        child_mate_scores = torch.zeros(
+            batch,
+            4,
+            ti,
+            ti,
+            dtype=torch.float32,
+            device=child_iface_mask.device,
+        )
+        return SimpleNamespace(
+            child_scores=child_scores,
+            child_mate_scores=child_mate_scores,
+        )
 
 
 # ─── Synthetic quadtree builder ──────────────────────────────────────────────
@@ -232,7 +305,7 @@ def test_pipeline_runs_without_crash():
     merge_enc.eval()
     merge_dec.eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5, fallback_exact=True)
+    runner = OnePassDPRunner(r=4, max_used=4, fallback_exact=True)
     result = runner.run_single(
         tokens=tokens, leaves=leaves,
         leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
@@ -243,6 +316,206 @@ def test_pipeline_runs_without_crash():
     print(f"  root_sigma={result.root_sigma}")
     print(f"  num_leaf_states={len(result.leaf_states)}")
     print(f"  stats={result.stats}")
+
+
+def test_pipeline_runs_without_crash_catalog_widening_iface_mate():
+    """The widening parse mode should run end-to-end on synthetic data."""
+    Ti, Tc, P, d = 8, 4, 4, 64
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    leaf_enc = StubLeafEncoder(d)
+    merge_enc = StubMergeEncoder(d)
+    merge_dec = MergeDecoder(
+        d_model=d,
+        n_heads=4,
+        num_iface_slots=Ti,
+        decoder_variant="iface_mate",
+        parent_num_layers=2,
+        cross_num_layers=1,
+        max_depth=16,
+    )
+
+    leaf_enc.eval()
+    merge_enc.eval()
+    merge_dec.eval()
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="catalog_widening_iface_mate",
+        child_catalog_widening=(2, 4),
+        fallback_exact=True,
+    )
+    result = runner.run_single(
+        tokens=tokens, leaves=leaves,
+        leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
+    )
+
+    assert isinstance(result, OnePassDPResult)
+    assert "num_widening_ok" in result.stats
+
+
+def test_pipeline_runs_without_crash_factorized_widening_iface_mate():
+    """The structured factorized path should run end-to-end without a catalog."""
+    Ti, Tc, P, d = 8, 4, 4, 64
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    leaf_enc = StubLeafEncoder(d)
+    merge_enc = StubMergeEncoder(d)
+    merge_dec = MergeDecoder(
+        d_model=d,
+        n_heads=4,
+        num_iface_slots=Ti,
+        decoder_variant="iface_mate",
+        parent_num_layers=2,
+        cross_num_layers=1,
+        max_depth=16,
+    )
+
+    leaf_enc.eval()
+    merge_enc.eval()
+    merge_dec.eval()
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="factorized_widening_iface_mate",
+        child_catalog_widening=(2, 4),
+        fallback_exact=True,
+    )
+    result = runner.run_single(
+        tokens=tokens,
+        leaves=leaves,
+        leaf_encoder=leaf_enc,
+        merge_encoder=merge_enc,
+        merge_decoder=merge_dec,
+        catalog=None,
+    )
+
+    assert isinstance(result, OnePassDPResult)
+    assert "num_widening_ok" in result.stats
+    assert result.cost_tables[0].state_list is not None
+
+
+def test_catalog_iface_mate_path_passes_raw_logits_to_parse(monkeypatch: pytest.MonkeyPatch):
+    Ti, Tc, P, d = 8, 4, 4, 64
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    captured = {}
+
+    def fake_parse_by_catalog_enum(*, scores, **kwargs):
+        if "scores" not in captured:
+            captured["scores"] = scores.detach().cpu().clone()
+        return float("inf"), (-1, -1, -1, -1)
+
+    monkeypatch.setattr(dp_runner_mod, "parse_by_catalog_enum", fake_parse_by_catalog_enum)
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="catalog_widening_iface_mate",
+        child_catalog_widening=(2,),
+        fallback_exact=False,
+    )
+    result = runner.run_single(
+        tokens=tokens,
+        leaves=leaves,
+        leaf_encoder=StubLeafEncoder(d),
+        merge_encoder=StubMergeEncoder(d),
+        merge_decoder=FixedLogitMergeDecoder(),
+    )
+
+    assert isinstance(result, OnePassDPResult)
+    assert "scores" in captured
+    assert float(captured["scores"].max().item()) > 1.0
+    assert float(captured["scores"].min().item()) < 0.0
+
+
+def test_factorized_iface_mate_path_passes_raw_logits_to_ranking(monkeypatch: pytest.MonkeyPatch):
+    Ti, Tc, P = 8, 4, 4
+    tokens, _ = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    captured = {}
+
+    def fake_prepare_factorized_child_rankings(*, scores, **kwargs):
+        if "scores" not in captured:
+            captured["scores"] = scores.detach().cpu().clone()
+        return None, "num_infeasible"
+
+    monkeypatch.setattr(dp_runner_mod, "prepare_factorized_child_rankings", fake_prepare_factorized_child_rankings)
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="factorized_widening_iface_mate",
+        child_catalog_widening=(2,),
+        fallback_exact=False,
+    )
+
+    root_nid = 0
+    children = tokens.tree_children_index[root_nid].long()
+    child_exists = children >= 0
+    ch_clamped = children.clamp_min(0)
+    maps = build_correspondence_maps(
+        parent_iface_eid=tokens.iface_eid[root_nid],
+        parent_iface_mask=tokens.iface_mask[root_nid].bool(),
+        parent_iface_bdir=tokens.iface_boundary_dir[root_nid],
+        parent_cross_eid=tokens.cross_eid[root_nid],
+        parent_cross_mask=tokens.cross_mask[root_nid].bool(),
+        parent_cross_child_pair=tokens.cross_child_pair[root_nid],
+        children_iface_eid=tokens.iface_eid[ch_clamped],
+        children_iface_mask=tokens.iface_mask[ch_clamped].bool(),
+        children_iface_bdir=tokens.iface_boundary_dir[ch_clamped],
+        child_exists=child_exists,
+    )
+    child_iface_mask_4 = tokens.iface_mask[ch_clamped].bool() & child_exists.unsqueeze(-1)
+    decode_scores = torch.full((1, 4, Ti), -10.0, dtype=torch.float32)
+    decode_scores[0, :, 0] = 10.0
+    decode_mate_scores = torch.zeros((1, 4, Ti, Ti), dtype=torch.float32)
+    state_used = torch.zeros((1, Ti), dtype=torch.bool)
+
+    prepared = runner._prepare_factorized_node_rankings(
+        candidate_indices=torch.tensor([0], dtype=torch.long),
+        decode_scores=decode_scores,
+        decode_mate_scores=decode_mate_scores,
+        parent_iface_mask=tokens.iface_mask[root_nid].bool(),
+        child_iface_mask_4=child_iface_mask_4,
+        child_exists=child_exists,
+        maps=maps,
+        child_tables=[None, None, None, None],
+        state_used=state_used,
+    )
+
+    assert prepared == [(0, None)]
+    assert "scores" in captured
+    assert float(captured["scores"].max().item()) > 1.0
+    assert float(captured["scores"].min().item()) < 0.0
+
+
+def test_factorized_parallel_parse_workers_path_runs():
+    Ti, Tc, P, d = 8, 4, 4, 64
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="factorized_widening_iface_mate",
+        child_catalog_widening=(2, 4),
+        fallback_exact=False,
+        num_parse_workers=2,
+    )
+    result = runner.run_single(
+        tokens=tokens,
+        leaves=leaves,
+        leaf_encoder=StubLeafEncoder(d),
+        merge_encoder=StubMergeEncoder(d),
+        merge_decoder=FixedLogitMergeDecoder(),
+    )
+
+    assert isinstance(result, OnePassDPResult)
+    assert 0 in result.cost_tables
+    assert result.cost_tables[0].state_list is not None
+    assert result.stats["num_internal"] == pytest.approx(1.0)
 
 
 def test_leaf_cost_tables_populated():
@@ -258,7 +531,7 @@ def test_leaf_cost_tables_populated():
     )
     leaf_enc.eval(); merge_enc.eval(); merge_dec.eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5)
+    runner = OnePassDPRunner(r=4, max_used=4)
     result = runner.run_single(
         tokens=tokens, leaves=leaves,
         leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
@@ -329,7 +602,7 @@ def test_root_tour_cost_is_rescaled_to_euclidean() -> None:
         parent_num_layers=1, cross_num_layers=1, max_depth=8,
     ).eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5)
+    runner = OnePassDPRunner(r=4, max_used=4)
     result = runner.run_single(
         tokens=tokens,
         leaves=leaves,
@@ -387,7 +660,7 @@ def test_native_direct_tour_on_root_leaf() -> None:
         parent_num_layers=1, cross_num_layers=1, max_depth=8,
     ).eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5)
+    runner = OnePassDPRunner(r=4, max_used=4)
     result = runner.run_single(
         tokens=tokens,
         leaves=leaves,
@@ -414,7 +687,7 @@ def test_traceback_reaches_leaves():
     )
     leaf_enc.eval(); merge_enc.eval(); merge_dec.eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5)
+    runner = OnePassDPRunner(r=4, max_used=4)
     result = runner.run_single(
         tokens=tokens, leaves=leaves,
         leaf_encoder=leaf_enc, merge_encoder=merge_enc, merge_decoder=merge_dec,
@@ -542,7 +815,7 @@ def test_fallback_no_truncation():
     leaf_enc.eval(); merge_enc.eval(); merge_dec.eval()
 
     runner = OnePassDPRunner(
-        r=4, max_used=4, topk=5, fallback_exact=True,
+        r=4, max_used=4, fallback_exact=True,
     )
     result = runner.run_single(
         tokens=tokens, leaves=leaves,
@@ -561,6 +834,38 @@ def test_fallback_no_truncation():
     print(f"  Root has {n_feasible} feasible states")
     print(f"  stats: {result.stats}")
     print(f"  tour_cost={result.tour_cost}")
+
+
+def test_legacy_heuristic_parse_mode_still_callable():
+    """Legacy heuristic parse should remain available through the runner API."""
+    Ti, Tc, P, d = 8, 4, 4, 64
+    tokens, leaves = build_synthetic_tree(Ti=Ti, Tc=Tc, P=P)
+
+    leaf_enc = StubLeafEncoder(d)
+    merge_enc = StubMergeEncoder(d)
+    merge_dec = MergeDecoder(
+        d_model=d, n_heads=4, num_iface_slots=Ti,
+        parent_num_layers=2, cross_num_layers=1, max_depth=16,
+    )
+    leaf_enc.eval(); merge_enc.eval(); merge_dec.eval()
+
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        topk=5,
+        parse_mode="heuristic",
+        fallback_exact=True,
+    )
+    result = runner.run_single(
+        tokens=tokens,
+        leaves=leaves,
+        leaf_encoder=leaf_enc,
+        merge_encoder=merge_enc,
+        merge_decoder=merge_dec,
+    )
+
+    assert isinstance(result, OnePassDPResult)
+    assert "num_topk_ok" in result.stats
 
 
 # ─── Run ─────────────────────────────────────────────────────────────────────

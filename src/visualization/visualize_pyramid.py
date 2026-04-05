@@ -31,34 +31,21 @@ def _get_alive_edge_index(data):
 
 def _tree_box_mode(data) -> str:
     """
-    Strong contract v2 writes:
+    Contract v2 writes:
       - data.tree_node_feat_box_mode == 0  => llwh(abs)
-    Older data may omit this field.
     Returns: "ll" or "center"
     """
-    if hasattr(data, "tree_node_feat_box_mode"):
-        try:
-            v = int(torch.as_tensor(getattr(data, "tree_node_feat_box_mode")).view(-1)[0].item())
-            if v == 0:
-                return "ll"
-            if v == 1:
-                return "center"
-        except Exception:
-            pass
-
-    # Backward-compatible heuristic: if root_bbox matches tree_node_feat[0] (llwh)
-    if hasattr(data, "root_bbox") and hasattr(data, "tree_node_feat"):
-        try:
-            root_bbox = data.root_bbox.detach().cpu().float().view(-1)
-            node0 = data.tree_node_feat[0].detach().cpu().float().view(-1)
-            if root_bbox.numel() == 4 and node0.numel() == 4:
-                if float((root_bbox - node0).abs().max().item()) < 1e-4:
-                    return "ll"
-        except Exception:
-            pass
-
-    # Conservative default (project default is llwh)
-    return "ll"
+    if not hasattr(data, "tree_node_feat_box_mode"):
+        raise RuntimeError("Missing tree_node_feat_box_mode in data. Regenerate dataset with Contract v2.")
+    try:
+        v = int(torch.as_tensor(getattr(data, "tree_node_feat_box_mode")).view(-1)[0].item())
+    except Exception as exc:  # pragma: no cover - defensive decoding for corrupted files
+        raise RuntimeError("Failed to parse tree_node_feat_box_mode from data.") from exc
+    if v == 0:
+        return "ll"
+    if v == 1:
+        return "center"
+    raise RuntimeError(f"Unsupported tree_node_feat_box_mode={v}.")
 
 
 def _node_bbox_from_feat(node_feat_row, box_mode: str) -> Tuple[float, float, float, float]:

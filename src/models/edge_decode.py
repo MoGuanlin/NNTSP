@@ -17,7 +17,6 @@ class TourDecodeResult:
     feasible: bool                   # degree=2 and single cycle
     num_off_spanner_edges: int       # how many edges not in spanner were used in patching
     num_components_initial: int       # components after greedy selection
-    num_edges_broken: int            # legacy: how many edges were removed to break subtours (should be 0)
     fallback_used: bool              # whether nearest-neighbor fallback was used
     num_patching_steps: int          # how many edges added in patching phase
     duration: float                  # execution time in seconds
@@ -94,7 +93,6 @@ def decode_tour_from_edge_logits(
     pos: Tensor,                  # [N,2]
     spanner_edge_index: Tensor,   # [2,E] local
     edge_logit: Tensor,           # [E] local, logits/scores (higher=better)
-    prefer_spanner_only: bool = True,
     allow_off_spanner_patch: bool = True,
     refine_max_n: Optional[int] = None,
     fallback_max_n: Optional[int] = None,
@@ -103,14 +101,13 @@ def decode_tour_from_edge_logits(
     Decode a Hamiltonian cycle from edge logits.
 
     Important semantics (fixed):
-      - prefer_spanner_only=True means: "use spanner edges whenever available",
-        BUT if allow_off_spanner_patch=True, we MAY add off-spanner edges for patching.
+      - The greedy construction phase always uses spanner edges only.
+      - If allow_off_spanner_patch=True, we MAY add off-spanner edges during patching.
       - If allow_off_spanner_patch=False, decoding is constrained to spanner edges only
         and may fail on some instances (expected).
 
     This is a postprocessing heuristic (engineering approximation), NOT DP backtracking.
     """
-    import heapq
     import time
     start_t = time.time()
 
@@ -148,25 +145,14 @@ def decode_tour_from_edge_logits(
 
     deg = [0] * N
     adj: List[List[int]] = [[] for _ in range(N)]
-    chosen: Dict[Tuple[int, int], float] = {}  # key -> score
     dsu = _DSU(N)
 
-    def can_add(a: int, b: int, chosen_edges: int) -> bool:
-        if deg[a] >= 2 or deg[b] >= 2:
-            return False
-        ra, rb = dsu.find(a), dsu.find(b)
-        if ra == rb:
-            # allow cycle only if it's the final closing edge
-            return chosen_edges == N - 1
-        return True
-
-    def add_edge(a: int, b: int, score: float, *, is_off_spanner: bool = False) -> None:
+    def add_edge(a: int, b: int) -> None:
         adj[a].append(b)
         adj[b].append(a)
         deg[a] += 1
         deg[b] += 1
         dsu.union(a, b)
-        chosen[_edge_key(a, b)] = score
 
     chosen_edges_count = 0
     for score, a, b in edges:
@@ -176,11 +162,11 @@ def decode_tour_from_edge_logits(
         ra, rb = dsu.find(a), dsu.find(b)
         if deg[a] < 2 and deg[b] < 2:
             if ra != rb:
-                add_edge(a, b, score)
+                add_edge(a, b)
                 chosen_edges_count += 1
             elif chosen_edges_count == N - 1 and dsu.sz[ra] == N:
                 # This is the final closing edge for the full Hamiltonian cycle
-                add_edge(a, b, score)
+                add_edge(a, b)
                 chosen_edges_count += 1
                 break
 
@@ -197,14 +183,8 @@ def decode_tour_from_edge_logits(
     fallback_used = False
     num_patching_steps = 0
     num_off_spanner_patching = 0
-    num_edges_broken = 0 # Legacy
 
     p_cpu = pos.detach().cpu()
-
-    def dist(a: int, b: int) -> float:
-        dx = float(p_cpu[a, 0].item() - p_cpu[b, 0].item())
-        dy = float(p_cpu[a, 1].item() - p_cpu[b, 1].item())
-        return (dx * dx + dy * dy) ** 0.5
 
     # --- PATCHING PHASE ---
     # We maintain comp_to_eps (component_id -> list of nodes with deg < 2)
@@ -241,7 +221,7 @@ def decode_tour_from_edge_logits(
             
             if best_off:
                 d, a, b, r_j = best_off
-                add_edge(a, b, -d)
+                add_edge(a, b)
                 chosen_edges_count += 1
                 num_patching_steps += 1
                 num_off_spanner_patching += 1
@@ -263,7 +243,7 @@ def decode_tour_from_edge_logits(
             key = _edge_key(a, b)
             if key not in sp_set:
                 num_off_spanner_patching += 1
-            add_edge(a, b, sp_logit.get(key, -get_dist(a, b)))
+            add_edge(a, b)
             chosen_edges_count += 1
             num_patching_steps += 1
             comp_to_eps[root] = []
@@ -278,7 +258,6 @@ def decode_tour_from_edge_logits(
                 length=float("inf"),
                 feasible=False,
                 num_off_spanner_edges=int(num_off_spanner_patching),
-                num_edges_broken=int(num_edges_broken),
                 num_components_initial=int(num_components_initial),
                 fallback_used=False,
                 num_patching_steps=int(num_patching_steps),
@@ -374,7 +353,6 @@ def decode_tour_from_edge_logits(
         length=length,
         feasible=feasible,
         num_off_spanner_edges=int(num_off_spanner_patching), 
-        num_edges_broken=int(num_edges_broken),
         num_components_initial=int(num_components_initial),
         fallback_used=fallback_used,
         num_patching_steps=int(num_patching_steps),

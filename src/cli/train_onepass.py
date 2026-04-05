@@ -10,8 +10,10 @@ but swaps the top-down decoder for the σ-conditioned MergeDecoder.
 Usage:
   python -m src.cli.train_onepass --train_pt <path> [options]
 
-The MergeDecoder is trained to predict child boundary states given a parent σ.
-Teacher σ comes from the PseudoLabeler's target_state_idx (matching mode).
+The MergeDecoder is trained to predict child boundary states given a parent sigma.
+Two supervision modes are supported:
+  - catalog_index: teacher sigma comes from target_state_idx (legacy capped mode)
+  - direct_structured: teacher sigma comes directly from per-node (used, mate)
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ from __future__ import annotations
 import argparse
 import datetime
 import gc
-import io
 import logging
 import os
 import pickle
@@ -38,6 +39,8 @@ from src.cli.model_factory import (
     build_onepass_training_models,
     restore_onepass_checkpoint_state,
 )
+from src.cli.runtime_batch_io import deserialize_torch_payload, serialize_torch_payload
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 
 # ─── Worker for DataLoader ───────────────────────────────────────────────────
 
@@ -50,36 +53,12 @@ class PrecomputedBatch:
     labels: Any
 
 
-def _ensure_labels_compat(labels: Any) -> Any:
-    """Backfill fields expected by the current training code for old caches."""
-    if not hasattr(labels, "m_state_exact"):
-        if hasattr(labels, "m_state") and isinstance(labels.m_state, torch.Tensor):
-            labels.m_state_exact = labels.m_state.bool().clone()
-        elif hasattr(labels, "target_state_idx") and isinstance(labels.target_state_idx, torch.Tensor):
-            labels.m_state_exact = (labels.target_state_idx >= 0).bool().clone()
-        elif hasattr(labels, "y_iface") and isinstance(labels.y_iface, torch.Tensor):
-            labels.m_state_exact = torch.zeros(
-                (int(labels.y_iface.shape[0]),),
-                dtype=torch.bool,
-                device=labels.y_iface.device,
-            )
-        else:
-            labels.m_state_exact = torch.zeros((0,), dtype=torch.bool)
-    return labels
+PRECOMPUTE_CACHE_SCHEMA_VERSION = 3
 
 
 def _load_precomputed_batch(batch_raw: Any) -> PrecomputedBatch:
     """Deserialize a possibly-bytes batch produced by OnePassWorker."""
-    if isinstance(batch_raw, bytes):
-        try:
-            batch = torch.load(io.BytesIO(batch_raw), map_location="cpu", weights_only=False)
-        except TypeError:
-            batch = torch.load(io.BytesIO(batch_raw), map_location="cpu")
-    else:
-        batch = batch_raw
-    if hasattr(batch, "labels"):
-        batch.labels = _ensure_labels_compat(batch.labels)
-    return batch
+    return deserialize_torch_payload(batch_raw)
 
 
 def _hist_add_from_values(hist: Dict[int, int], values: torch.Tensor) -> None:
@@ -257,9 +236,7 @@ class OnePassWorker:
         labels = self.labeler.label_batch(datas=datas, packed=packed, device=torch.device("cpu"))
         batch = PrecomputedBatch(packed=packed, labels=labels)
         if self.num_workers > 0:
-            buf = io.BytesIO()
-            torch.save(batch, buf)
-            return buf.getvalue()
+            return serialize_torch_payload(batch)
         return batch
 
 
@@ -278,7 +255,8 @@ def _catalog_from_packed(packed) -> "BoundaryStateCatalog":
 
 def _precompute_cache_path(
     train_pt: str, batch_size: int, r: int, max_used: int,
-    two_opt_passes: int = 30, use_lkh: bool = False,
+    supervision_mode: str = "catalog_index",
+    iface_order: str = "legacy",
     teacher_signature: str = "",
 ) -> Path:
     """Derive a deterministic cache path from key parameters."""
@@ -288,8 +266,9 @@ def _precompute_cache_path(
     label_source = fast_path if fast_path.exists() else src
     stat = label_source.stat() if label_source.exists() else None
     key = (
-        f"{src}|bs={batch_size}|r={r}|mu={max_used}"
-        f"|2opt={two_opt_passes}|lkh={use_lkh}"
+        f"{src}|schema={PRECOMPUTE_CACHE_SCHEMA_VERSION}|bs={batch_size}|r={r}|mu={max_used}"
+        f"|sup={supervision_mode}"
+        f"|iface_order={iface_order}"
         f"|teacher={teacher_signature}"
         f"|src_mtime_ns={(stat.st_mtime_ns if stat else 0)}"
         f"|src_size={(stat.st_size if stat else 0)}"
@@ -332,14 +311,7 @@ def _precompute_batches(
 
     batches = []
     for batch_raw in tqdm(loader, desc="[precompute] packing + labeling"):
-        if isinstance(batch_raw, bytes):
-            try:
-                batch = torch.load(io.BytesIO(batch_raw), map_location="cpu", weights_only=False)
-            except TypeError:
-                batch = torch.load(io.BytesIO(batch_raw), map_location="cpu")
-        else:
-            batch = batch_raw
-        batches.append(batch)
+        batches.append(_load_precomputed_batch(batch_raw))
 
     # Save to disk for next run
     if cache_path is not None:
@@ -365,6 +337,27 @@ def main() -> None:
     parser.add_argument("--r", type=int, default=4)
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--matching_max_used", type=int, default=4)
+    parser.add_argument(
+        "--iface_order",
+        type=str,
+        default="clockwise",
+        choices=["legacy", "clockwise"],
+        help="interface-slot order; clockwise is required for semantically correct 1-pass DP states",
+    )
+    parser.add_argument(
+        "--supervision_mode",
+        type=str,
+        default="catalog_index",
+        choices=["catalog_index", "direct_structured"],
+        help="legacy capped catalog-index supervision or uncapped direct structured supervision",
+    )
+    parser.add_argument(
+        "--decoder_variant",
+        type=str,
+        default="iface",
+        choices=["iface", "iface_mate"],
+        help="one-pass decoder head variant; 'iface_mate' adds mate logits alongside iface logits",
+    )
     parser.add_argument("--parent_num_layers", type=int, default=3, help="self-attention layers in parent memory")
     parser.add_argument("--cross_num_layers", type=int, default=2, help="cross-attention layers for sigma query")
 
@@ -375,6 +368,12 @@ def main() -> None:
     parser.add_argument("--wd", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--pos_weight", type=float, default=0.0, help="pos_weight for BCE (0 = disabled)")
+    parser.add_argument(
+        "--mate_loss_weight",
+        type=float,
+        default=1.0,
+        help="weight for child mate classification loss when decoder_variant=iface_mate",
+    )
     parser.add_argument(
         "--child_target_mode",
         type=str,
@@ -412,11 +411,12 @@ def main() -> None:
                         help="disable batch pre-computation (use streaming DataLoader instead)")
 
     # Teacher
-    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
-    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
     parser.add_argument("--lkh_exe", type=str, default=default_lkh)
-    parser.add_argument("--teacher_lkh_runs", type=int, default=1)
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="0 disables timeout")
+    add_teacher_lkh_args(
+        parser,
+        runs_help="number of LKH runs for sparse-spanner teacher generation",
+        timeout_help="timeout in seconds for one sparse-spanner teacher solve (0 disables timeout)",
+    )
 
     # Resume
     parser.add_argument("--ckpt", type=str, default="")
@@ -432,19 +432,29 @@ def main() -> None:
     from src.models.onepass_trainer import (
         OnePassTrainRunner,
         build_child_iface_targets_from_states,
+        build_child_mate_targets_from_states,
+        build_child_mate_targets_from_structured_states,
         onepass_loss,
     )
-    from src.models.labeler import PseudoLabeler
     from src.dataprep.dataset import smart_load_dataset
 
     d = int(args.d_model)
     r = int(args.r)
     Ti = 4 * r  # interface slots = 4 * r
 
-    # ─── Packer (matching mode required) ──────────────────────────────
+    supervision_mode = str(args.supervision_mode)
+    iface_order = str(args.iface_order)
+    if supervision_mode == "direct_structured" and iface_order != "clockwise":
+        raise ValueError(
+            "direct_structured supervision requires --iface_order=clockwise, "
+            f"got {iface_order!r}"
+        )
+
+    # ─── Packer ───────────────────────────────────────────────────────
     packer = NodeTokenPacker(
         r=r,
-        state_mode="matching",
+        state_mode=("matching" if supervision_mode == "catalog_index" else "iface"),
+        iface_order=iface_order,
         matching_max_used=int(args.matching_max_used),
     )
 
@@ -454,8 +464,10 @@ def main() -> None:
         d_model=d,
         r=r,
         matching_max_used=int(args.matching_max_used),
+        decoder_variant=str(args.decoder_variant),
         parent_num_layers=int(args.parent_num_layers),
         cross_num_layers=int(args.cross_num_layers),
+        iface_order=iface_order,
     )
     leaf_encoder = model_bundle.leaf_encoder
     merge_encoder = model_bundle.merge_encoder
@@ -463,14 +475,10 @@ def main() -> None:
 
     runner = OnePassTrainRunner()
 
-    labeler = PseudoLabeler(
-        two_opt_passes=int(args.two_opt_passes),
-        use_lkh=bool(args.use_lkh),
+    labeler = build_spanner_teacher_labeler(
         lkh_exe=str(args.lkh_exe),
+        config=teacher_lkh_config_from_args(args),
         prefer_cpu=True,
-        teacher_mode="spanner_lkh",
-        teacher_lkh_runs=int(args.teacher_lkh_runs),
-        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
     print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
 
@@ -555,7 +563,8 @@ def main() -> None:
     if use_precompute:
         cache_path = _precompute_cache_path(
             args.train_pt, int(args.batch_size), r, int(args.matching_max_used),
-            two_opt_passes=int(args.two_opt_passes), use_lkh=bool(args.use_lkh),
+            supervision_mode=supervision_mode,
+            iface_order=iface_order,
             teacher_signature=labeler.label_signature(),
         )
         log(f"[data] Precompute cache: {cache_path}")
@@ -583,15 +592,18 @@ def main() -> None:
             collate_fn=OnePassWorker(packer, labeler, num_workers=int(args.num_workers)),
         )
 
-    log("[teacher] Scanning training-set teacher boundary usage...")
-    t_teacher = time.time()
-    teacher_usage_summary = _collect_teacher_max_used_stats(
-        cached_batches if use_precompute else train_loader,
-        configured_max_used=int(args.matching_max_used),
-        show_progress=True,
-    )
-    log(f"[teacher] max_used stats computed in {time.time() - t_teacher:.1f}s")
-    _log_teacher_max_used_stats(teacher_usage_summary, log)
+    if supervision_mode == "catalog_index":
+        log("[teacher] Scanning training-set teacher boundary usage...")
+        t_teacher = time.time()
+        teacher_usage_summary = _collect_teacher_max_used_stats(
+            cached_batches if use_precompute else train_loader,
+            configured_max_used=int(args.matching_max_used),
+            show_progress=True,
+        )
+        log(f"[teacher] max_used stats computed in {time.time() - t_teacher:.1f}s")
+        _log_teacher_max_used_stats(teacher_usage_summary, log)
+    else:
+        log("[teacher] supervision_mode=direct_structured: skipping capped max_used startup scan")
 
     # ─── Training loop ────────────────────────────────────────────────
     global_step = 0
@@ -614,8 +626,13 @@ def main() -> None:
 
     log(f"[train] Starting 1-pass training: {args.epochs} epochs, bs={args.batch_size}")
     log(f"[train] Models: LeafEnc + MergeEnc + MergeDecoder (d={d}, Ti={Ti})")
+    log(f"[train] Supervision mode: {supervision_mode}")
+    log(f"[train] Interface order: {iface_order}")
+    log(f"[train] Decoder variant: {model_bundle.decoder_variant}")
     log(f"[train] Params: {sum(p.numel() for p in params):,}")
     log(f"[train] Child target mode: {args.child_target_mode}")
+    if supervision_mode == "direct_structured":
+        log(f"[train] matching_max_used={args.matching_max_used} is ignored by the direct_structured supervision path")
     if use_amp:
         log(f"[train] AMP enabled ({amp_dtype})")
     if use_precompute:
@@ -641,43 +658,88 @@ def main() -> None:
             packed = move_data_tensors_to_device(batch.packed, device)
             labels = move_data_tensors_to_device(batch.labels, device)
 
-            # Check that state catalog exists
-            if packed.state_catalog is None:
-                raise RuntimeError(
-                    "1-pass training requires state_mode='matching'. "
-                    "PackedBatch has no state_catalog."
-                )
-
-            catalog = _catalog_from_packed(packed)
+            catalog = None
+            if supervision_mode == "catalog_index":
+                if packed.state_catalog is None:
+                    raise RuntimeError(
+                        "catalog_index supervision requires state_mode='matching'. "
+                        "PackedBatch has no state_catalog."
+                    )
+                catalog = _catalog_from_packed(packed)
 
             # Forward: 1-pass bottom-up with σ-conditioned decode
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                result = runner.run_batch(
-                    batch=packed,
-                    leaf_encoder=leaf_encoder,
-                    merge_encoder=merge_encoder,
-                    merge_decoder=merge_decoder,
-                    catalog=catalog,
-                    target_state_idx=labels.target_state_idx,
-                    m_state=labels.m_state_exact,
-                )
+                if supervision_mode == "catalog_index":
+                    result = runner.run_batch(
+                        batch=packed,
+                        leaf_encoder=leaf_encoder,
+                        merge_encoder=merge_encoder,
+                        merge_decoder=merge_decoder,
+                        catalog=catalog,
+                        target_state_idx=labels.target_state_idx,
+                        m_state=labels.m_state_exact,
+                        supervision_mode="catalog_index",
+                    )
 
-                if args.child_target_mode == "raw_iface":
+                    if args.child_target_mode == "raw_iface":
+                        y_child_target = labels.y_child_iface
+                        m_child_target = labels.m_child_iface
+                    else:
+                        child_state_mask = (
+                            labels.m_state_exact
+                            if args.child_target_mode == "state_exact"
+                            else labels.m_state
+                        )
+                        y_child_target, m_child_target = build_child_iface_targets_from_states(
+                            tree_children_index=packed.tokens.tree_children_index,
+                            m_child_iface=labels.m_child_iface,
+                            target_state_idx=labels.target_state_idx,
+                            child_state_mask=child_state_mask,
+                            state_used_iface=catalog.used_iface,
+                        )
+
+                    y_child_mate = None
+                    m_child_mate = None
+                    if str(args.decoder_variant) == "iface_mate":
+                        child_state_mask = (
+                            labels.m_state_exact
+                            if args.child_target_mode == "state_exact"
+                            else labels.m_state
+                        )
+                        y_child_mate, m_child_mate = build_child_mate_targets_from_states(
+                            tree_children_index=packed.tokens.tree_children_index,
+                            m_child_iface=labels.m_child_iface,
+                            target_state_idx=labels.target_state_idx,
+                            child_state_mask=child_state_mask,
+                            state_used_iface=catalog.used_iface,
+                            state_mate=catalog.mate,
+                        )
+                else:
+                    result = runner.run_batch(
+                        batch=packed,
+                        leaf_encoder=leaf_encoder,
+                        merge_encoder=merge_encoder,
+                        merge_decoder=merge_decoder,
+                        catalog=None,
+                        parent_sigma_used=labels.parent_sigma_used,
+                        parent_sigma_mate=labels.parent_sigma_mate,
+                        m_state=labels.m_parent_sigma_structured,
+                        supervision_mode="direct_structured",
+                    )
+
                     y_child_target = labels.y_child_iface
                     m_child_target = labels.m_child_iface
-                else:
-                    child_state_mask = (
-                        labels.m_state_exact
-                        if args.child_target_mode == "state_exact"
-                        else labels.m_state
-                    )
-                    y_child_target, m_child_target = build_child_iface_targets_from_states(
-                        tree_children_index=packed.tokens.tree_children_index,
-                        m_child_iface=labels.m_child_iface,
-                        target_state_idx=labels.target_state_idx,
-                        child_state_mask=child_state_mask,
-                        state_used_iface=catalog.used_iface,
-                    )
+
+                    y_child_mate = None
+                    m_child_mate = None
+                    if str(args.decoder_variant) == "iface_mate":
+                        y_child_mate, m_child_mate = build_child_mate_targets_from_structured_states(
+                            tree_children_index=packed.tokens.tree_children_index,
+                            m_child_iface=labels.m_child_iface,
+                            parent_sigma_used=labels.parent_sigma_used,
+                            parent_sigma_mate=labels.parent_sigma_mate,
+                            m_parent_sigma_structured=labels.m_parent_sigma_structured,
+                        )
 
                 # Loss
                 loss = onepass_loss(
@@ -686,6 +748,10 @@ def main() -> None:
                     y_child_iface=y_child_target,
                     m_child_iface=m_child_target,
                     pos_weight=pw,
+                    child_mate_scores=result.child_mate_scores,
+                    y_child_mate=y_child_mate,
+                    m_child_mate=m_child_mate,
+                    mate_weight=float(args.mate_loss_weight),
                 )
 
             # Backward

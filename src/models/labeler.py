@@ -47,6 +47,9 @@ class TokenLabels:
       m_state: [M] bool
       m_state_exact: [M] bool (True only when target_state_idx is an exact match)
       stats: dict of diagnostics
+      parent_sigma_used: optional [M,Ti] bool — direct structured parent sigma activation
+      parent_sigma_mate: optional [M,Ti] long — direct structured parent sigma matching
+      m_parent_sigma_structured: optional [M] bool — direct structured parent sigma availability
     """
 
     y_cross: Tensor
@@ -59,6 +62,9 @@ class TokenLabels:
     m_state: Tensor
     m_state_exact: Tensor
     stats: Dict[str, Tensor]
+    parent_sigma_used: Optional[Tensor] = None
+    parent_sigma_mate: Optional[Tensor] = None
+    m_parent_sigma_structured: Optional[Tensor] = None
 
 
 class InfeasibleTeacherGraphError(RuntimeError):
@@ -123,8 +129,6 @@ class PseudoLabeler:
     def __init__(
         self,
         *,
-        two_opt_passes: int = 50,
-        use_lkh: bool = False,
         lkh_exe: str = "LKH",
         prefer_cpu: bool = True,
         teacher_mode: str = "spanner_lkh",
@@ -133,8 +137,6 @@ class PseudoLabeler:
         teacher_exact_timeout: float = 30.0,
         teacher_exact_max_nodes: int = 100,
     ) -> None:
-        self.two_opt_passes = int(two_opt_passes)
-        self.use_lkh = bool(use_lkh)
         self.lkh_exe = resolve_lkh_executable(str(lkh_exe))
         self.prefer_cpu = bool(prefer_cpu)
         self.teacher_mode = str(teacher_mode)
@@ -450,14 +452,6 @@ class PseudoLabeler:
             stats,
         )
 
-    def extract_target_edges(
-        self,
-        data: Any,
-    ) -> Tuple[Any, float]:
-        """Backward-compatible wrapper returning only edge ids and length."""
-        te, tlen, _, _ = self.extract_teacher_supervision(data)
-        return te, tlen
-
     def label_one(
         self,
         *,
@@ -597,6 +591,9 @@ class PseudoLabeler:
             m_state=torch.zeros((int(y_iface.shape[0]),), dtype=torch.bool, device=device),
             m_state_exact=torch.zeros((int(y_iface.shape[0]),), dtype=torch.bool, device=device),
             stats={k: v.to(device) for k, v in stats.items()},
+            parent_sigma_used=torch.zeros((int(y_iface.shape[0]), int(y_iface.shape[1])), dtype=torch.bool, device=device),
+            parent_sigma_mate=torch.full((int(y_iface.shape[0]), int(y_iface.shape[1])), -1, dtype=torch.long, device=device),
+            m_parent_sigma_structured=torch.zeros((int(y_iface.shape[0]),), dtype=torch.bool, device=device),
         )
 
     def label_batch(
@@ -677,11 +674,19 @@ class PseudoLabeler:
         y_cross_all = map_labels(tokens.cross_eid)
         y_iface_all = map_labels(tokens.iface_eid)
 
+        parent_sigma_used = (y_iface_all > 0.5) & m_iface_all
+        parent_sigma_mate = torch.full((total_M, Ti), -1, dtype=torch.long, device=device)
+        m_parent_sigma_structured = torch.zeros((total_M,), dtype=torch.bool, device=device)
+
         target_state_idx = torch.full((total_M,), -1, dtype=torch.long, device=device)
         m_state = torch.zeros((total_M,), dtype=torch.bool, device=device)
         m_state_exact = torch.zeros((total_M,), dtype=torch.bool, device=device)
         num_state_exact = 0
         num_state_fallback = 0
+        state_mask_all = None
+        state_used_iface = None
+        state_mate = None
+        max_used = None
         if getattr(tokens, "state_mask", None) is not None and getattr(packed, "state_catalog", None) is not None:
             state_mask_all = tokens.state_mask.bool().to(device)
             state_used_iface = packed.state_catalog.used_iface.to(device)
@@ -689,46 +694,70 @@ class PseudoLabeler:
             max_used = int(getattr(packed.state_catalog, "max_used", int(state_used_iface.sum(dim=1).max().item())))
             m_state = state_mask_all.any(dim=1)
 
-            for b in range(B):
-                m0 = int(node_ptr[b].item())
-                m1 = int(node_ptr[b + 1].item())
-                e0 = int(edge_ptr[b].item())
-                selected_local_eids = set(int(x) for x in getattr(datas[b], "target_edges", torch.empty((0,), dtype=torch.long)).detach().cpu().tolist())
-                node_points = _compute_node_point_sets(datas[b])
-                sp_edge_index = getattr(datas[b], "spanner_edge_index").detach().cpu()
-                sp_u = sp_edge_index[0].tolist()
-                sp_v = sp_edge_index[1].tolist()
+        num_structured_exact = 0
+        for b in range(B):
+            m0 = int(node_ptr[b].item())
+            m1 = int(node_ptr[b + 1].item())
+            e0 = int(edge_ptr[b].item())
+            selected_local_eids = set(int(x) for x in getattr(datas[b], "target_edges", torch.empty((0,), dtype=torch.long)).detach().cpu().tolist())
+            node_points = _compute_node_point_sets(datas[b])
+            sp_edge_index = getattr(datas[b], "spanner_edge_index").detach().cpu()
+            sp_u = sp_edge_index[0].tolist()
+            sp_v = sp_edge_index[1].tolist()
 
-                iface_eid_local = tokens.iface_eid[m0:m1].to(device) - e0
-                iface_mask_local = m_iface_all[m0:m1]
-                iface_inside_ep_local = tokens.iface_inside_endpoint[m0:m1].to(device)
-                state_mask_local = state_mask_all[m0:m1]
+            iface_eid_local = tokens.iface_eid[m0:m1].to(device) - e0
+            iface_mask_local = m_iface_all[m0:m1]
+            iface_inside_ep_local = tokens.iface_inside_endpoint[m0:m1].to(device)
+            state_mask_local = None if state_mask_all is None else state_mask_all[m0:m1]
 
-                for local_nid in range(m1 - m0):
-                    mid = m0 + local_nid
-                    if not bool(m_state[mid].item()):
-                        continue
+            for local_nid in range(m1 - m0):
+                mid = m0 + local_nid
 
-                    state_idx, exact_used = _build_matching_target_for_node(
-                        local_node_id=local_nid,
-                        points_in_node=node_points[local_nid],
-                        selected_local_eids=selected_local_eids,
-                        sp_u=sp_u,
-                        sp_v=sp_v,
-                        iface_eid_row=iface_eid_local[local_nid],
-                        iface_mask_row=iface_mask_local[local_nid],
-                        iface_inside_ep_row=iface_inside_ep_local[local_nid],
-                        state_mask_row=state_mask_local[local_nid],
-                        state_used_iface=state_used_iface,
-                        state_mate=state_mate,
-                        max_used=max_used,
-                    )
-                    target_state_idx[mid] = int(state_idx)
-                    if exact_used:
-                        m_state_exact[mid] = True
-                        num_state_exact += 1
-                    else:
-                        num_state_fallback += 1
+                sigma_used, sigma_mate, structured_exact = _build_matching_target_for_node_structured(
+                    local_node_id=local_nid,
+                    points_in_node=node_points[local_nid],
+                    selected_local_eids=selected_local_eids,
+                    sp_u=sp_u,
+                    sp_v=sp_v,
+                    iface_eid_row=iface_eid_local[local_nid],
+                    iface_mask_row=iface_mask_local[local_nid],
+                    iface_inside_ep_row=iface_inside_ep_local[local_nid],
+                )
+                parent_sigma_used[mid] = sigma_used
+                parent_sigma_mate[mid] = sigma_mate
+                m_parent_sigma_structured[mid] = structured_exact
+                if structured_exact:
+                    num_structured_exact += 1
+
+                if (
+                    state_mask_local is None
+                    or state_used_iface is None
+                    or state_mate is None
+                    or max_used is None
+                    or not bool(m_state[mid].item())
+                ):
+                    continue
+
+                state_idx, exact_used = _build_matching_target_for_node(
+                    local_node_id=local_nid,
+                    points_in_node=node_points[local_nid],
+                    selected_local_eids=selected_local_eids,
+                    sp_u=sp_u,
+                    sp_v=sp_v,
+                    iface_eid_row=iface_eid_local[local_nid],
+                    iface_mask_row=iface_mask_local[local_nid],
+                    iface_inside_ep_row=iface_inside_ep_local[local_nid],
+                    state_mask_row=state_mask_local[local_nid],
+                    state_used_iface=state_used_iface,
+                    state_mate=state_mate,
+                    max_used=max_used,
+                )
+                target_state_idx[mid] = int(state_idx)
+                if exact_used:
+                    m_state_exact[mid] = True
+                    num_state_exact += 1
+                else:
+                    num_state_fallback += 1
 
         num_direct_sum = sum(int(getattr(d, "teacher_num_direct", len(getattr(d, "target_edges", [])))) for d in datas)
         num_projected_sum = sum(int(getattr(d, "teacher_num_projected", 0)) for d in datas)
@@ -747,6 +776,7 @@ class PseudoLabeler:
             "num_unreachable_sum": torch.tensor([num_unreachable_sum], device=device),
             "num_state_exact_sum": torch.tensor([num_state_exact], device=device),
             "num_state_fallback_sum": torch.tensor([num_state_fallback], device=device),
+            "num_parent_sigma_structured_sum": torch.tensor([num_structured_exact], device=device),
         }
 
         # ---- child BC labels (GLOBAL packed indices) ----
@@ -768,6 +798,9 @@ class PseudoLabeler:
             m_state=m_state,
             m_state_exact=m_state_exact,
             stats=stats,
+            parent_sigma_used=parent_sigma_used,
+            parent_sigma_mate=parent_sigma_mate,
+            m_parent_sigma_structured=m_parent_sigma_structured,
         )
 
 
@@ -825,6 +858,99 @@ def _infer_inside_point_for_interface(
     if in_a and in_b:
         return a if inside_ep_attr == 0 else b
     return None
+
+
+def _build_matching_target_for_node_structured(
+    *,
+    local_node_id: int,
+    points_in_node: set[int],
+    selected_local_eids: set[int],
+    sp_u: List[int],
+    sp_v: List[int],
+    iface_eid_row: Tensor,               # [Ti] local eid
+    iface_mask_row: Tensor,              # [Ti] bool
+    iface_inside_ep_row: Tensor,         # [Ti] long
+) -> tuple[Tensor, Tensor, bool]:
+    """Return direct structured boundary labels without any catalog projection."""
+    del local_node_id  # reserved for future debugging / stats hooks
+
+    Ti = int(iface_mask_row.numel())
+    target_used = torch.zeros((Ti,), dtype=torch.bool, device=iface_mask_row.device)
+    target_mate = torch.full((Ti,), -1, dtype=torch.long, device=iface_mask_row.device)
+
+    stub_points: Dict[int, int] = {}
+    fallback_needed = False
+
+    for i in range(Ti):
+        if not bool(iface_mask_row[i].item()):
+            continue
+        eid = int(iface_eid_row[i].item())
+        if eid < 0 or eid not in selected_local_eids:
+            continue
+
+        target_used[i] = True
+        a = int(sp_u[eid])
+        b = int(sp_v[eid])
+        inside_point = _infer_inside_point_for_interface(
+            a=a,
+            b=b,
+            inside_ep_attr=int(iface_inside_ep_row[i].item()),
+            points_in_node=points_in_node,
+        )
+        if inside_point is None:
+            fallback_needed = True
+            continue
+        stub_points[i] = inside_point
+
+    used_slots = [slot for slot, used in enumerate(target_used.tolist()) if used]
+    if len(used_slots) == 0:
+        return target_used, target_mate, True
+
+    if len(used_slots) % 2 != 0:
+        fallback_needed = True
+
+    touched_points = set(stub_points.values())
+    internal_edges: List[Tuple[int, int]] = []
+    for eid in selected_local_eids:
+        a = int(sp_u[eid])
+        b = int(sp_v[eid])
+        if a in points_in_node and b in points_in_node:
+            internal_edges.append((a, b))
+            touched_points.add(a)
+            touched_points.add(b)
+
+    parent: Dict[int, int] = {p: p for p in touched_points}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, b in internal_edges:
+        union(a, b)
+
+    comp_to_slots: Dict[int, List[int]] = {}
+    for slot, point in stub_points.items():
+        root = find(point)
+        comp_to_slots.setdefault(root, []).append(slot)
+
+    for slots in comp_to_slots.values():
+        if len(slots) != 2:
+            fallback_needed = True
+            continue
+        i, j = int(slots[0]), int(slots[1])
+        target_mate[i] = j
+        target_mate[j] = i
+
+    structured_exact = (not fallback_needed) and all(int(target_mate[i].item()) >= 0 for i in used_slots)
+    return target_used, target_mate, structured_exact
 
 
 def _build_matching_target_for_node(
@@ -949,4 +1075,9 @@ def _build_matching_target_for_node(
     ), False
 
 
-__all__ = ["PseudoLabeler", "TokenLabels"]
+__all__ = [
+    "PseudoLabeler",
+    "TokenLabels",
+    "_build_matching_target_for_node",
+    "_build_matching_target_for_node_structured",
+]

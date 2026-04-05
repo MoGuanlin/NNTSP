@@ -338,6 +338,7 @@ class NodeTokenPacker:
         r: int | None = None,
         *,
         state_mode: str = "iface",
+        iface_order: str = "legacy",
         matching_max_used: int = 4,
         max_iface_per_node: int | None = None,
         max_cross_per_node: int | None = None,
@@ -345,6 +346,7 @@ class NodeTokenPacker:
     ) -> None:
         self.r = None if r is None else int(r)
         self.state_mode = str(state_mode)
+        self.iface_order = str(iface_order)
         self.matching_max_used = int(matching_max_used)
         self.max_iface_per_node = None if max_iface_per_node is None else int(max_iface_per_node)
         self.max_cross_per_node = None if max_cross_per_node is None else int(max_cross_per_node)
@@ -354,10 +356,24 @@ class NodeTokenPacker:
             raise ValueError("r must be positive.")
         if self.state_mode not in {"iface", "matching"}:
             raise ValueError(f"Unknown state_mode: {self.state_mode}")
+        if self.iface_order not in {"legacy", "clockwise"}:
+            raise ValueError(f"Unknown iface_order: {self.iface_order}")
         if self.matching_max_used <= 0:
             raise ValueError("matching_max_used must be positive.")
         if self.max_points_per_leaf <= 0:
             raise ValueError("max_points_per_leaf must be positive.")
+
+    def _use_clockwise_iface_order(self) -> bool:
+        """Return whether interface slots should follow true perimeter order.
+
+        `legacy` preserves the historical behavior where only matching-mode
+        packing used clockwise ordering. Structured one-pass DP states also rely
+        on a boundary-cycle order, so new callers should pass
+        `iface_order="clockwise"` explicitly even when `state_mode="iface"`.
+        """
+        if self.iface_order == "clockwise":
+            return True
+        return self.state_mode == "matching"
 
     def _pack_single(self, data: Any) -> Tuple[PackedNodeTokens, PackedLeafPoints, int, int, int, int, float]:
         """
@@ -415,7 +431,7 @@ class NodeTokenPacker:
             iface_dir=iface_dir,
             iface_inside_ep=iface_inside_ep,
             iface_inside_quad=iface_inside_quad,
-            clockwise=(self.state_mode == "matching"),
+            clockwise=self._use_clockwise_iface_order(),
         )
 
         # caps

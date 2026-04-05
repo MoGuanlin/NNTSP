@@ -31,7 +31,7 @@ This file implements a callable nn.Module matching the MergeEncoder Protocol use
 
 from __future__ import annotations
 
-from typing import Dict, Tuple, Union
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover
     from .set_transformer_block import SetTransformerEncoder, cls_pool
 
 
-class MergeEncoderModule(nn.Module):
+class MergeEncoder(nn.Module):
     """
     Merge encoder producing z_parent: [B, d_model].
 
@@ -73,7 +73,6 @@ class MergeEncoderModule(nn.Module):
         tokenizer_mlp_layers: int = 2,
         use_angle_sincos: bool = True,
         max_depth: int = 64,
-        return_aux: bool = False,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -88,7 +87,6 @@ class MergeEncoderModule(nn.Module):
             raise ValueError("max_depth must be positive.")
 
         self.d_model = int(d_model)
-        self.return_aux = bool(return_aux)
 
         # Base tokenizer for CLS/IFACE/CROSS/CHILD (scale-invariant)
         # NOTE: node_ctx/type_embed are added explicitly in this module, mirroring LeafEncoderModule.
@@ -193,12 +191,8 @@ class MergeEncoderModule(nn.Module):
         cross_is_leaf_internal: Tensor,   # [B,Tc] bool
         child_z: Tensor,                  # [B,4,d_model] (TL/TR/BL/BR)
         child_mask: Tensor,               # [B,4] bool
-    ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
-        """
-        Return:
-          z_parent: [B,d_model]
-          optionally (z_parent, aux_dict)
-        """
+    ) -> Tensor:
+        """Return `z_parent` with shape `[B, d_model]`."""
         self._check_shapes_merge(
             node_feat_rel=node_feat_rel,
             node_depth=node_depth,
@@ -258,18 +252,7 @@ class MergeEncoderModule(nn.Module):
         # ---- 5) Pool (CLS) ----
         z_parent = cls_pool(out_tokens, cls_index=mem.cls_index)  # [B,d]
 
-        if not self.return_aux:
-            return z_parent
-
-        aux: Dict[str, Tensor] = {
-            "T_total": torch.tensor([tokens.shape[1]], device=node_feat_rel.device),
-            "num_iface_valid": iface_mask.sum(dim=1).to(dtype=torch.long),
-            "num_cross_valid": cross_mask.sum(dim=1).to(dtype=torch.long),
-            "num_child_valid": child_mask.sum(dim=1).to(dtype=torch.long),
-        }
-        return z_parent, aux
+        return z_parent
 
 
-# Backward-compatible public API name expected by runner/tests
-MergeEncoder = MergeEncoderModule
-__all__ = ["MergeEncoder", "MergeEncoderModule"]
+__all__ = ["MergeEncoder"]

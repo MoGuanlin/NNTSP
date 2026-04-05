@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+from itertools import permutations
 from pathlib import Path
 
 import torch
@@ -907,6 +908,68 @@ class TestLeafExactSolve:
             box_xy=box_xy,
         )
         assert abs(costs[0].item() - 1.0) < 1e-5, f"Expected 1.0, got {costs[0].item()}"
+
+    def test_one_path_segment_with_seven_points_uses_exact_solver(self):
+        """A 7-point open path should still match the exact optimum.
+
+        This regression test targets the old heuristic fallback branch for
+        open-path leaves with more than 6 points.
+        """
+        Ti = 4
+        S = 1
+        points_xy = torch.tensor([
+            [0.6183689966753316, 0.25050634136244054],
+            [0.9097462559682401, 0.9827854760376531],
+            [0.8102172359965896, 0.9021659504395827],
+            [0.3101475693193326, 0.7298317482601286],
+            [0.8988382879679935, 0.6839839319154413],
+            [0.47214271545271336, 0.1007012080683658],
+            [0.4341718354537837, 0.6108869734438016],
+        ])
+        point_mask = torch.ones(points_xy.shape[0], dtype=torch.bool)
+
+        iface_eid = torch.full((Ti,), -1, dtype=torch.long)
+        iface_mask = torch.zeros(Ti, dtype=torch.bool)
+        iface_bdir = torch.full((Ti,), -1, dtype=torch.long)
+        iface_feat6 = torch.zeros(Ti, 6)
+
+        iface_eid[0] = 0; iface_mask[0] = True; iface_bdir[0] = 0
+        iface_eid[1] = 1; iface_mask[1] = True; iface_bdir[1] = 1
+        iface_feat6[0, 2] = -1.0; iface_feat6[0, 3] = 0.0
+        iface_feat6[1, 2] = 1.0; iface_feat6[1, 3] = 0.0
+
+        state_used = torch.zeros(S, Ti, dtype=torch.bool)
+        state_used[0, 0] = True; state_used[0, 1] = True
+        state_mate = torch.full((S, Ti), -1, dtype=torch.long)
+        state_mate[0, 0] = 1; state_mate[0, 1] = 0
+        state_mask = torch.tensor([True])
+        box_xy = torch.tensor([0.0, 0.0, 2.0, 2.0])
+
+        expected = float("inf")
+        start = torch.tensor([-1.0, 0.0])
+        end = torch.tensor([1.0, 0.0])
+        for perm in permutations(range(points_xy.shape[0])):
+            path_len = (start - points_xy[perm[0]]).norm().item()
+            for idx in range(len(perm) - 1):
+                path_len += (points_xy[perm[idx]] - points_xy[perm[idx + 1]]).norm().item()
+            path_len += (points_xy[perm[-1]] - end).norm().item()
+            expected = min(expected, path_len)
+
+        costs = leaf_exact_solve(
+            points_xy=points_xy,
+            point_mask=point_mask,
+            iface_eid=iface_eid,
+            iface_mask=iface_mask,
+            iface_boundary_dir=iface_bdir,
+            iface_feat6=iface_feat6,
+            state_used_iface=state_used,
+            state_mate=state_mate,
+            state_mask=state_mask,
+            box_xy=box_xy,
+        )
+        assert abs(costs[0].item() - expected) < 1e-5, (
+            f"Expected exact open-path cost {expected}, got {costs[0].item()}"
+        )
 
 
 # ─── Runner ───────────────────────────────────────────────────────────────────

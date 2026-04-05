@@ -338,21 +338,15 @@ def _solve_leaf_state(
             witness = LeafStateWitness(closed_cycle=(0,)) if return_witness else None
             return 0.0, witness
 
-        if num_points <= 18:
-            dist = [[0.0] * num_points for _ in range(num_points)]
-            for a in range(num_points):
-                for b in range(a + 1, num_points):
-                    d = (valid_points[a] - valid_points[b]).norm().item()
-                    dist[a][b] = dist[b][a] = d
-            if return_witness:
-                cost, order = _held_karp_tsp_with_order(dist)
-                return cost, LeafStateWitness(closed_cycle=tuple(order))
-            return _held_karp_tsp(dist), None
-
+        dist = [[0.0] * num_points for _ in range(num_points)]
+        for a in range(num_points):
+            for b in range(a + 1, num_points):
+                d = (valid_points[a] - valid_points[b]).norm().item()
+                dist[a][b] = dist[b][a] = d
         if return_witness:
-            cost, order = _nn_tsp_with_order(valid_points)
+            cost, order = _held_karp_tsp_with_order(dist)
             return cost, LeafStateWitness(closed_cycle=tuple(order))
-        return _nn_tsp(valid_points), None
+        return _held_karp_tsp(dist), None
 
     if num_paths == 1 and num_points == 0:
         cost = (iface_pos[pairs[0][0]] - iface_pos[pairs[0][1]]).norm().item()
@@ -361,100 +355,68 @@ def _solve_leaf_state(
             witness = LeafStateWitness(open_paths=(LeafPathWitness(pairs[0][0], pairs[0][1], ()),))
         return cost, witness
 
-    if num_points <= 6:
-        all_pts = list(range(num_points))
-        best_cost = INF
-        best_orders: Optional[List[List[int]]] = None
+    all_pts = list(range(num_points))
+    best_cost = INF
+    best_orders: Optional[List[List[int]]] = None
 
-        def _enumerate_distributions(remaining: List[int], assignment: List[List[int]], depth: int) -> None:
-            nonlocal best_cost, best_orders
-            if depth == len(remaining):
-                total = 0.0
-                chosen_orders: List[List[int]] = []
-                for path_idx, (pa, pb) in enumerate(pairs):
-                    pts_in_path = assignment[path_idx]
-                    start = iface_pos[pa]
-                    end = iface_pos[pb]
-                    if len(pts_in_path) == 0:
-                        total += (start - end).norm().item()
-                        chosen_orders.append([])
-                        continue
+    def _enumerate_distributions(remaining: List[int], assignment: List[List[int]], depth: int) -> None:
+        nonlocal best_cost, best_orders
+        if depth == len(remaining):
+            total = 0.0
+            chosen_orders: List[List[int]] = []
+            for path_idx, (pa, pb) in enumerate(pairs):
+                pts_in_path = assignment[path_idx]
+                start = iface_pos[pa]
+                end = iface_pos[pb]
+                if len(pts_in_path) == 0:
+                    total += (start - end).norm().item()
+                    chosen_orders.append([])
+                    continue
 
-                    best_path = INF
-                    best_order: List[int] = []
-                    for perm in _all_permutations(len(pts_in_path)):
-                        path_len = 0.0
-                        prev = start
-                        order_local: List[int] = []
-                        for pi in perm:
-                            cur_idx = pts_in_path[pi]
-                            cur = valid_points[cur_idx]
-                            path_len += (prev - cur).norm().item()
-                            prev = cur
-                            order_local.append(cur_idx)
-                        path_len += (prev - end).norm().item()
-                        if path_len < best_path:
-                            best_path = path_len
-                            best_order = order_local
-                    total += best_path
-                    chosen_orders.append(best_order)
+                best_path = INF
+                best_order: List[int] = []
+                for perm in _all_permutations(len(pts_in_path)):
+                    path_len = 0.0
+                    prev = start
+                    order_local: List[int] = []
+                    for pi in perm:
+                        cur_idx = pts_in_path[pi]
+                        cur = valid_points[cur_idx]
+                        path_len += (prev - cur).norm().item()
+                        prev = cur
+                        order_local.append(cur_idx)
+                    path_len += (prev - end).norm().item()
+                    if path_len < best_path:
+                        best_path = path_len
+                        best_order = order_local
+                total += best_path
+                chosen_orders.append(best_order)
 
-                if total < best_cost:
-                    best_cost = total
-                    if return_witness:
-                        best_orders = [o[:] for o in chosen_orders]
-                return
+            if total < best_cost:
+                best_cost = total
+                if return_witness:
+                    best_orders = [o[:] for o in chosen_orders]
+            return
 
-            pt = remaining[depth]
-            for path_idx in range(num_paths):
-                assignment[path_idx].append(pt)
-                _enumerate_distributions(remaining, assignment, depth + 1)
-                assignment[path_idx].pop()
+        pt = remaining[depth]
+        for path_idx in range(num_paths):
+            assignment[path_idx].append(pt)
+            _enumerate_distributions(remaining, assignment, depth + 1)
+            assignment[path_idx].pop()
 
-        init_assignment: List[List[int]] = [[] for _ in range(num_paths)]
-        _enumerate_distributions(all_pts, init_assignment, 0)
-
-        if not return_witness:
-            return best_cost, None
-        if best_orders is None:
-            return best_cost, None
-
-        open_paths = tuple(
-            LeafPathWitness(pa, pb, tuple(best_orders[path_idx]))
-            for path_idx, (pa, pb) in enumerate(pairs)
-        )
-        return best_cost, LeafStateWitness(open_paths=open_paths)
-
-    path_assignments: List[List[int]] = [[] for _ in range(num_paths)]
-    for pi in range(num_points):
-        best_d, best_path = float("inf"), 0
-        for pidx, (pa, pb) in enumerate(pairs):
-            d = min(
-                (valid_points[pi] - iface_pos[pa]).norm().item(),
-                (valid_points[pi] - iface_pos[pb]).norm().item(),
-            )
-            if d < best_d:
-                best_d, best_path = d, pidx
-        path_assignments[best_path].append(pi)
-
-    total = 0.0
-    orders: List[List[int]] = []
-    for pidx, (pa, pb) in enumerate(pairs):
-        if return_witness:
-            path_cost, order = _nn_path_with_order(valid_points, iface_pos[pa], iface_pos[pb], path_assignments[pidx])
-            total += path_cost
-            orders.append(order)
-        else:
-            total += _nn_path(valid_points, iface_pos[pa], iface_pos[pb], path_assignments[pidx])
+    init_assignment: List[List[int]] = [[] for _ in range(num_paths)]
+    _enumerate_distributions(all_pts, init_assignment, 0)
 
     if not return_witness:
-        return total, None
+        return best_cost, None
+    if best_orders is None:
+        return best_cost, None
 
     open_paths = tuple(
-        LeafPathWitness(pa, pb, tuple(orders[pidx]))
-        for pidx, (pa, pb) in enumerate(pairs)
+        LeafPathWitness(pa, pb, tuple(best_orders[path_idx]))
+        for path_idx, (pa, pb) in enumerate(pairs)
     )
-    return total, LeafStateWitness(open_paths=open_paths)
+    return best_cost, LeafStateWitness(open_paths=open_paths)
 
 
 def leaf_solve_state(

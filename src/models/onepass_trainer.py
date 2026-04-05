@@ -1,30 +1,21 @@
 # src/models/onepass_trainer.py
 # -*- coding: utf-8 -*-
-"""
-Training-time 1-pass bottom-up runner with σ-conditioned MergeDecoder.
+"""Training-time 1-pass bottom-up runner with sigma-conditioned MergeDecoder.
 
-Unlike the inference-time OnePassDPRunner (which enumerates σ candidates and builds
-cost tables), this module runs a single forward pass per internal node using the
-**teacher σ** from the labeler.  The output is differentiable child activation
-logits [M, 4, Ti] that can be trained with standard BCE loss against y_child_iface.
+Two supervision modes are supported in parallel:
 
-Flow (per internal node):
-  1. MergeEncoder(children_z) → z_parent          (shared with 2-pass)
-  2. MergeDecoder.build_parent_memory(z_parent, children_z, tokens)
-  3. MergeDecoder.decode_sigma(teacher_σ)  → child_scores [1, 4, Ti]
-  4. Collect into output tensor for loss computation
+  - `catalog_index`: legacy path using teacher `target_state_idx`
+  - `direct_structured`: uncapped path using direct `(used, mate)` parent sigma
 
-The bottom-up encoding part (leaf + merge) reuses BottomUpTreeRunner logic with
-differentiable index_copy write-back.
-
-IMPORTANT: This is a NEW module for the 1-pass DP training. It does NOT modify
-or replace any existing 2-pass training code.
+Unlike the inference-time OnePassDPRunner (which enumerates sigma candidates and
+builds cost tables), this module runs a single forward pass per internal node
+using teacher sigma labels from the labeler.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -43,10 +34,12 @@ class OnePassTrainResult:
 
     z:                 [M, d_model]  — node embeddings (differentiable)
     child_scores:      [M, 4, Ti]   — predicted child activation logits (differentiable)
+    child_mate_scores: optional [M, 4, Ti, Ti] — predicted mate logits
     decode_mask:       [M] bool     — which internal nodes had valid teacher σ
     """
     z: Tensor
     child_scores: Tensor
+    child_mate_scores: Optional[Tensor]
     decode_mask: Tensor
 
 # ─── Main Runner ─────────────────────────────────────────────────────────────
@@ -75,11 +68,12 @@ class OnePassTrainRunner:
         leaf_encoder,
         merge_encoder,
         merge_decoder: MergeDecoder,
-        catalog: BoundaryStateCatalog,
-        target_state_idx: Tensor,   # [M] long — teacher state per node (-1 = skip)
-        m_state: Tensor,            # [M] bool — which nodes have valid teacher state
-                                    # IMPORTANT: pass m_state_exact here to avoid
-                                    # inconsistent σ ↔ y_child_iface pairs (Bug 1 fix)
+        catalog: Optional[BoundaryStateCatalog] = None,
+        target_state_idx: Optional[Tensor] = None,   # [M] long — legacy teacher state per node
+        m_state: Optional[Tensor] = None,            # [M] bool — legacy valid teacher-state mask
+        parent_sigma_used: Optional[Tensor] = None,  # [M, Ti] bool — direct structured parent sigma
+        parent_sigma_mate: Optional[Tensor] = None,  # [M, Ti] long
+        supervision_mode: str = "catalog_index",
     ) -> OnePassTrainResult:
         """Run differentiable 1-pass forward on a packed batch."""
         tokens = batch.tokens
@@ -96,6 +90,9 @@ class OnePassTrainRunner:
             catalog=catalog,
             target_state_idx=target_state_idx,
             m_state=m_state,
+            parent_sigma_used=parent_sigma_used,
+            parent_sigma_mate=parent_sigma_mate,
+            supervision_mode=supervision_mode,
         )
 
     def run_single(
@@ -106,9 +103,12 @@ class OnePassTrainRunner:
         leaf_encoder,
         merge_encoder,
         merge_decoder: MergeDecoder,
-        catalog: BoundaryStateCatalog,
-        target_state_idx: Tensor,
-        m_state: Tensor,
+        catalog: Optional[BoundaryStateCatalog] = None,
+        target_state_idx: Optional[Tensor] = None,
+        m_state: Optional[Tensor] = None,
+        parent_sigma_used: Optional[Tensor] = None,
+        parent_sigma_mate: Optional[Tensor] = None,
+        supervision_mode: str = "catalog_index",
     ) -> OnePassTrainResult:
         """Run on a single graph (no batch packing)."""
         M = int(tokens.tree_parent_index.numel())
@@ -125,6 +125,9 @@ class OnePassTrainRunner:
             catalog=catalog,
             target_state_idx=target_state_idx,
             m_state=m_state,
+            parent_sigma_used=parent_sigma_used,
+            parent_sigma_mate=parent_sigma_mate,
+            supervision_mode=supervision_mode,
         )
 
     def _run_core(
@@ -136,13 +139,21 @@ class OnePassTrainRunner:
         leaf_encoder,
         merge_encoder,
         merge_decoder: MergeDecoder,
-        catalog: BoundaryStateCatalog,
-        target_state_idx: Tensor,
-        m_state: Tensor,
+        catalog: Optional[BoundaryStateCatalog],
+        target_state_idx: Optional[Tensor],
+        m_state: Optional[Tensor],
+        parent_sigma_used: Optional[Tensor],
+        parent_sigma_mate: Optional[Tensor],
+        supervision_mode: str,
     ) -> OnePassTrainResult:
         device = tokens.tree_parent_index.device
         total_M = int(tokens.tree_parent_index.numel())
         Ti = int(tokens.iface_mask.shape[1])
+        mode = str(supervision_mode)
+        if mode not in ("catalog_index", "direct_structured"):
+            raise ValueError(
+                f"supervision_mode must be 'catalog_index' or 'direct_structured', got {mode!r}"
+            )
 
         # Build leaf_row_for_node
         leaf_row_for_node = torch.full((total_M,), -1, dtype=torch.long, device=device)
@@ -154,14 +165,24 @@ class OnePassTrainRunner:
         depth = tokens.tree_node_depth.long()
         max_depth = int(depth.max().item()) if depth.numel() > 0 else 0
 
-        # Pre-transfer catalog to device (avoid per-node transfers)
-        cat_used = catalog.used_iface.float().to(device)   # [S, Ti]
-        cat_mate = catalog.mate.to(device)                 # [S, Ti]
+        cat_used = None
+        cat_mate = None
+        if mode == "catalog_index":
+            if catalog is None or target_state_idx is None or m_state is None:
+                raise ValueError("catalog_index supervision requires catalog, target_state_idx and m_state")
+            cat_used = catalog.used_iface.float().to(device)   # [S, Ti]
+            cat_mate = catalog.mate.to(device)                 # [S, Ti]
+        else:
+            if parent_sigma_used is None or parent_sigma_mate is None or m_state is None:
+                raise ValueError(
+                    "direct_structured supervision requires parent_sigma_used, parent_sigma_mate and m_state"
+                )
 
         # Output tensors
         z: Optional[Tensor] = None
         # child_scores accumulates per-depth batched (nids, scores) pairs
         child_scores_list = []  # [(nids_tensor, scores_tensor), ...]
+        child_mate_scores_list = []  # [(nids_tensor, mate_scores_tensor), ...]
         decode_mask = torch.zeros(total_M, dtype=torch.bool, device=device)
 
         computed = torch.zeros(total_M, dtype=torch.bool, device=device)
@@ -215,15 +236,25 @@ class OnePassTrainRunner:
                 computed[internal_nids] = True
 
                 # ── Batched σ-conditioned decoding ──────────────────
-                # Filter to nodes with valid teacher state (no Python loop)
-                valid_mask = m_state[internal_nids] & (target_state_idx[internal_nids] >= 0)
+                if mode == "catalog_index":
+                    assert m_state is not None and target_state_idx is not None
+                    valid_mask = m_state[internal_nids] & (target_state_idx[internal_nids] >= 0)
+                else:
+                    assert m_state is not None
+                    valid_mask = m_state[internal_nids].bool()
                 valid_nids = internal_nids[valid_mask]
 
                 if valid_nids.numel() > 0:
                     # Gather teacher sigma for all valid nodes at once
-                    si = target_state_idx[valid_nids]                    # [K] long
-                    sigma_a = cat_used[si]                               # [K, Ti] float
-                    sigma_mate = cat_mate[si]                            # [K, Ti] long
+                    if mode == "catalog_index":
+                        assert target_state_idx is not None and cat_used is not None and cat_mate is not None
+                        si = target_state_idx[valid_nids]                    # [K] long
+                        sigma_a = cat_used[si]                               # [K, Ti] float
+                        sigma_mate = cat_mate[si]                            # [K, Ti] long
+                    else:
+                        assert parent_sigma_used is not None and parent_sigma_mate is not None
+                        sigma_a = parent_sigma_used[valid_nids].float()
+                        sigma_mate = parent_sigma_mate[valid_nids].long()
 
                     # Gather children info (batched)
                     ch_v = tokens.tree_children_index[valid_nids].long() # [K, 4]
@@ -269,6 +300,8 @@ class OnePassTrainRunner:
                     # out.child_scores: [K, 4, Ti]
 
                     child_scores_list.append((valid_nids, out.child_scores))
+                    if out.child_mate_scores is not None:
+                        child_mate_scores_list.append((valid_nids, out.child_mate_scores))
                     decode_mask[valid_nids] = True
 
         if z is None:
@@ -282,9 +315,19 @@ class OnePassTrainRunner:
             all_scores = torch.cat([s for _, s in child_scores_list]).float()
             child_scores = child_scores.index_copy(0, all_nids, all_scores)
 
+        child_mate_scores: Optional[Tensor] = None
+        if child_mate_scores_list:
+            child_mate_scores = torch.zeros(
+                total_M, 4, Ti, Ti, dtype=torch.float32, device=device
+            )
+            all_mate_nids = torch.cat([n for n, _ in child_mate_scores_list])
+            all_mate_scores = torch.cat([s for _, s in child_mate_scores_list]).float()
+            child_mate_scores = child_mate_scores.index_copy(0, all_mate_nids, all_mate_scores)
+
         return OnePassTrainResult(
             z=z,
             child_scores=child_scores,
+            child_mate_scores=child_mate_scores,
             decode_mask=decode_mask,
         )
 # ─── Loss helper ─────────────────────────────────────────────────────────────
@@ -296,6 +339,10 @@ def onepass_loss(
     y_child_iface: Tensor,      # [M, 4, Ti] from TokenLabels
     m_child_iface: Tensor,      # [M, 4, Ti] bool from TokenLabels
     pos_weight: Optional[float] = None,
+    child_mate_scores: Optional[Tensor] = None,  # [M, 4, Ti, Ti]
+    y_child_mate: Optional[Tensor] = None,       # [M, 4, Ti] long
+    m_child_mate: Optional[Tensor] = None,       # [M, 4, Ti] bool
+    mate_weight: float = 0.0,
 ) -> Tensor:
     """Compute BCE loss for 1-pass σ-conditioned child predictions.
 
@@ -315,9 +362,24 @@ def onepass_loss(
 
     if pos_weight is not None:
         pw = child_scores.new_tensor(float(pos_weight))
-        loss = F.binary_cross_entropy_with_logits(logit, target, reduction="mean", pos_weight=pw)
+        iface_loss = F.binary_cross_entropy_with_logits(logit, target, reduction="mean", pos_weight=pw)
     else:
-        loss = F.binary_cross_entropy_with_logits(logit, target, reduction="mean")
+        iface_loss = F.binary_cross_entropy_with_logits(logit, target, reduction="mean")
+
+    loss = iface_loss
+    use_mate = (
+        child_mate_scores is not None
+        and y_child_mate is not None
+        and m_child_mate is not None
+        and float(mate_weight) > 0.0
+    )
+    if use_mate:
+        mate_mask = m_child_mate.bool() & decode_mask.unsqueeze(-1).unsqueeze(-1)
+        if mate_mask.any().item():
+            mate_logits = child_mate_scores[mate_mask]
+            mate_target = y_child_mate[mate_mask].long()
+            mate_loss = F.cross_entropy(mate_logits, mate_target, reduction="mean")
+            loss = loss + child_scores.new_tensor(float(mate_weight)) * mate_loss
 
     return loss
 
@@ -353,9 +415,73 @@ def build_child_iface_targets_from_states(
     return y_child, m_child
 
 
+def build_child_mate_targets_from_states(
+    *,
+    tree_children_index: Tensor,   # [M, 4]
+    m_child_iface: Tensor,         # [M, 4, Ti] bool
+    target_state_idx: Tensor,      # [M] long
+    child_state_mask: Tensor,      # [M] bool
+    state_used_iface: Tensor,      # [S, Ti] bool
+    state_mate: Tensor,            # [S, Ti] long
+) -> Tuple[Tensor, Tensor]:
+    """Build child mate supervision from catalog-aligned child states.
+
+    Only active child slots from valid child states are supervised.
+    """
+    device = tree_children_index.device
+    ch = tree_children_index.long()
+    exists = ch >= 0
+    ch0 = ch.clamp_min(0)
+
+    child_state_ok = child_state_mask[ch0] & exists
+    child_target_idx = target_state_idx[ch0]
+    safe_idx = child_target_idx.clamp_min(0)
+    used_table = state_used_iface.to(device=device).bool()
+    mate_table = state_mate.to(device=device).long()
+
+    child_used = used_table[safe_idx]
+    y_child_mate = mate_table[safe_idx]
+    valid_child = child_state_ok & (child_target_idx >= 0)
+    m_child_mate = m_child_iface.bool() & valid_child.unsqueeze(-1) & child_used
+    y_child_mate = torch.where(
+        m_child_mate,
+        y_child_mate,
+        torch.zeros_like(y_child_mate),
+    )
+    return y_child_mate, m_child_mate
+
+
+def build_child_mate_targets_from_structured_states(
+    *,
+    tree_children_index: Tensor,        # [M, 4]
+    m_child_iface: Tensor,              # [M, 4, Ti] bool
+    parent_sigma_used: Tensor,          # [M, Ti] bool
+    parent_sigma_mate: Tensor,          # [M, Ti] long
+    m_parent_sigma_structured: Tensor,  # [M] bool
+) -> Tuple[Tensor, Tensor]:
+    """Build child mate supervision by gathering direct structured child sigma."""
+    device = tree_children_index.device
+    ch = tree_children_index.long()
+    exists = ch >= 0
+    ch0 = ch.clamp_min(0)
+
+    child_sigma_used = parent_sigma_used.to(device=device).bool()[ch0]
+    child_sigma_mate = parent_sigma_mate.to(device=device).long()[ch0]
+    child_structured_ok = m_parent_sigma_structured.to(device=device).bool()[ch0] & exists
+    m_child_mate = m_child_iface.bool() & child_structured_ok.unsqueeze(-1) & child_sigma_used
+    y_child_mate = torch.where(
+        m_child_mate,
+        child_sigma_mate,
+        torch.zeros_like(child_sigma_mate),
+    )
+    return y_child_mate, m_child_mate
+
+
 __all__ = [
     "OnePassTrainRunner",
     "OnePassTrainResult",
+    "build_child_mate_targets_from_structured_states",
+    "build_child_mate_targets_from_states",
     "onepass_loss",
     "build_child_iface_targets_from_states",
 ]

@@ -103,11 +103,109 @@ def test_catalog_enum_cap_can_fallback_to_exact() -> None:
     assert used_fallback is True
 
 
+def test_catalog_widening_retries_schedule_before_succeeding() -> None:
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="catalog_widening_iface_mate",
+        child_catalog_widening=(2, 4, 8),
+        fallback_exact=True,
+    )
+
+    scores = torch.zeros(4, 2, dtype=torch.float32)
+    mate_scores = torch.zeros(4, 2, 2, dtype=torch.float32)
+    parent_a = torch.zeros(2, dtype=torch.bool)
+    parent_mate = torch.full((2,), -1, dtype=torch.long)
+    parent_iface_mask = torch.ones(2, dtype=torch.bool)
+    child_iface_mask = torch.ones(4, 2, dtype=torch.bool)
+    child_exists = torch.ones(4, dtype=torch.bool)
+    maps = mock.Mock()
+    cat_used = torch.zeros(3, 2, dtype=torch.bool)
+    cat_mate = torch.full((3, 2), -1, dtype=torch.long)
+    child_costs = [torch.zeros(3, dtype=torch.float32) for _ in range(4)]
+
+    with mock.patch("src.models.dp_runner.parse_by_catalog_enum") as patched:
+        patched.side_effect = [
+            (float("inf"), (-1, -1, -1, -1)),
+            (float("inf"), (-1, -1, -1, -1)),
+            (5.0, (0, 1, 1, 0)),
+        ]
+        cost, child_si, outcome = runner._parse_catalog_enum_with_widening(
+            scores=scores,
+            mate_scores=mate_scores,
+            parent_a=parent_a,
+            parent_mate=parent_mate,
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask=child_iface_mask,
+            child_exists=child_exists,
+            maps=maps,
+            cat_used=cat_used,
+            cat_mate=cat_mate,
+            child_costs=child_costs,
+            ranking_mode="iface_mate",
+        )
+
+    assert patched.call_count == 3
+    assert [call.kwargs["max_child_states"] for call in patched.call_args_list] == [2, 4, 8]
+    assert cost == 5.0
+    assert child_si == (0, 1, 1, 0)
+    assert outcome == "num_widening_ok"
+
+
+def test_catalog_widening_can_use_exact_after_schedule() -> None:
+    runner = OnePassDPRunner(
+        r=4,
+        max_used=4,
+        parse_mode="catalog_widening",
+        child_catalog_widening=(2, 4),
+        fallback_exact=True,
+    )
+
+    scores = torch.zeros(4, 2, dtype=torch.float32)
+    parent_a = torch.zeros(2, dtype=torch.bool)
+    parent_mate = torch.full((2,), -1, dtype=torch.long)
+    parent_iface_mask = torch.ones(2, dtype=torch.bool)
+    child_iface_mask = torch.ones(4, 2, dtype=torch.bool)
+    child_exists = torch.ones(4, dtype=torch.bool)
+    maps = mock.Mock()
+    cat_used = torch.zeros(3, 2, dtype=torch.bool)
+    cat_mate = torch.full((3, 2), -1, dtype=torch.long)
+    child_costs = [torch.zeros(3, dtype=torch.float32) for _ in range(4)]
+
+    with mock.patch("src.models.dp_runner.parse_by_catalog_enum") as patched:
+        patched.side_effect = [
+            (float("inf"), (-1, -1, -1, -1)),
+            (float("inf"), (-1, -1, -1, -1)),
+            (7.5, (0, 1, 2, 0)),
+        ]
+        cost, child_si, outcome = runner._parse_catalog_enum_with_widening(
+            scores=scores,
+            parent_a=parent_a,
+            parent_mate=parent_mate,
+            parent_iface_mask=parent_iface_mask,
+            child_iface_mask=child_iface_mask,
+            child_exists=child_exists,
+            maps=maps,
+            cat_used=cat_used,
+            cat_mate=cat_mate,
+            child_costs=child_costs,
+            ranking_mode="iface",
+        )
+
+    assert patched.call_count == 3
+    assert [call.kwargs["max_child_states"] for call in patched.call_args_list] == [2, 4, None]
+    assert cost == 7.5
+    assert child_si == (0, 1, 2, 0)
+    assert outcome == "num_fallback"
+
+
 if __name__ == "__main__":
     tests = [
         ("truncate after c1 and sort", test_truncation_happens_after_c1_and_sort),
         ("nonpositive cap disables truncation", test_nonpositive_cap_disables_child_truncation),
         ("catalog cap can fallback to exact", test_catalog_enum_cap_can_fallback_to_exact),
+        ("catalog widening retries schedule", test_catalog_widening_retries_schedule_before_succeeding),
+        ("catalog widening can fallback to exact", test_catalog_widening_can_use_exact_after_schedule),
     ]
 
     for name, fn in tests:

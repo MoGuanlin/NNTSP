@@ -144,8 +144,4 @@ def aggregate_logits_to_edges(
 
     return EdgeScores(edge_logit=edge_logit, edge_mask=edge_mask)
 
-
-# Alias for backward compatibility
-aggregate_cross_logits_to_edges = aggregate_logits_to_edges
-
-__all__ = ["EdgeScores", "infer_num_edges_from_tokens", "aggregate_logits_to_edges", "aggregate_cross_logits_to_edges"]
+__all__ = ["EdgeScores", "infer_num_edges_from_tokens", "aggregate_logits_to_edges"]

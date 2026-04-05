@@ -63,7 +63,7 @@ def test_collect_teacher_max_used_stats_basic():
     print("teacher max_used summary =", summary)
 
 
-def test_collect_teacher_max_used_stats_backfills_missing_exact_mask():
+def test_collect_teacher_max_used_stats_uses_exact_mask():
     packed = SimpleNamespace(
         tokens=SimpleNamespace(
             is_leaf=torch.tensor([False, False], dtype=torch.bool),
@@ -78,7 +78,7 @@ def test_collect_teacher_max_used_stats_backfills_missing_exact_mask():
             dtype=torch.float32,
         ),
         m_iface=torch.ones((2, 4), dtype=torch.bool),
-        m_state=torch.tensor([True, False], dtype=torch.bool),
+        m_state_exact=torch.tensor([True, False], dtype=torch.bool),
     )
     batch = PrecomputedBatch(packed=packed, labels=labels)
 
@@ -95,5 +95,5 @@ def test_collect_teacher_max_used_stats_backfills_missing_exact_mask():
 
 if __name__ == "__main__":
     test_collect_teacher_max_used_stats_basic()
-    test_collect_teacher_max_used_stats_backfills_missing_exact_mask()
+    test_collect_teacher_max_used_stats_uses_exact_mask()
     print("test_teacher_max_used_stats.py: PASS")

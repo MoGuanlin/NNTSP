@@ -170,6 +170,38 @@ class TestMergeDecoder:
 
         assert isinstance(out, MergeDecoderOutput)
         assert out.child_scores.shape == (1, 4, Ti)
+        assert out.child_mate_scores is None
+
+    def test_decode_sigma_shape_iface_mate(self):
+        B, Ti, Tc, d = 1, 8, 4, 64
+        decoder = MergeDecoder(
+            d_model=d,
+            n_heads=4,
+            num_iface_slots=Ti,
+            decoder_variant="iface_mate",
+            parent_num_layers=2,
+            cross_num_layers=1,
+            max_depth=16,
+        )
+        inputs = _make_dummy_inputs(B, Ti, Tc, d)
+
+        mem = decoder.build_parent_memory(**inputs)
+        sigma_a = torch.zeros(1, Ti)
+        sigma_mate = torch.full((1, Ti), -1, dtype=torch.long)
+        sigma_iface_mask = torch.ones(1, Ti, dtype=torch.bool)
+        child_iface_mask = torch.ones(1, 4, Ti, dtype=torch.bool)
+
+        out = decoder.decode_sigma(
+            sigma_a=sigma_a,
+            sigma_mate=sigma_mate,
+            sigma_iface_mask=sigma_iface_mask,
+            parent_memory=mem,
+            child_iface_mask=child_iface_mask,
+        )
+
+        assert out.child_scores.shape == (1, 4, Ti)
+        assert out.child_mate_scores is not None
+        assert out.child_mate_scores.shape == (1, 4, Ti, Ti)
 
     def test_decode_sigma_batch_shape(self):
         """Test batch decoding of multiple sigmas for one parent."""

@@ -1,18 +1,13 @@
 # src/models/tour_reconstruct.py
 # -*- coding: utf-8 -*-
 """
-Tour reconstruction utilities for 1-pass DP results.
+Direct tour reconstruction utilities for 1-pass DP results.
 
-This module supports two reconstruction modes:
+Primary path:
+  DP traceback -> leaf witnesses -> internal gluing -> explicit Hamiltonian tour
 
-1. Native direct reconstruction:
-   DP traceback -> leaf witnesses -> internal gluing -> explicit Hamiltonian tour
-
-2. Legacy logit projection:
-   DP traceback -> hard iface/cross logits -> edge decoder
-
-The direct path is the primary 1-pass output. The logit projection remains as an
-engineering baseline / compatibility path for greedy / exact / LKH post-decoding.
+Legacy logit-projection helpers live in `tour_reconstruct_legacy.py` and are
+kept out of this main module on purpose.
 """
 
 from __future__ import annotations
@@ -33,7 +28,6 @@ from .dp_core import (
 from .dp_runner import CostTableEntry, OnePassDPResult
 from .node_token_packer import PackedLeafPoints, PackedNodeTokens
 from .shared_tree import build_leaf_row_for_node
-from .tour_reconstruct_legacy import dp_result_to_edge_scores, dp_result_to_logits
 
 
 class _ReconstructionError(RuntimeError):
@@ -151,6 +145,7 @@ def _to_cpu_tensor(x: Tensor) -> Tensor:
 def _to_cpu_tokens(tokens: PackedNodeTokens) -> SimpleNamespace:
     return SimpleNamespace(
         tree_children_index=_to_cpu_tensor(tokens.tree_children_index),
+        tree_node_depth=_to_cpu_tensor(tokens.tree_node_depth),
         tree_node_feat_rel=_to_cpu_tensor(tokens.tree_node_feat_rel),
         is_leaf=_to_cpu_tensor(tokens.is_leaf),
         root_id=_to_cpu_tensor(tokens.root_id),
@@ -174,7 +169,9 @@ def _to_cpu_leaves(leaves: PackedLeafPoints) -> SimpleNamespace:
     )
 
 
-def _to_cpu_catalog(catalog: BoundaryStateCatalog) -> BoundaryStateCatalog:
+def _to_cpu_catalog(catalog: Optional[BoundaryStateCatalog]) -> Optional[BoundaryStateCatalog]:
+    if catalog is None:
+        return None
     return BoundaryStateCatalog(
         used_iface=_to_cpu_tensor(catalog.used_iface),
         mate=_to_cpu_tensor(catalog.mate),
@@ -182,6 +179,21 @@ def _to_cpu_catalog(catalog: BoundaryStateCatalog) -> BoundaryStateCatalog:
         empty_index=int(catalog.empty_index),
         max_used=int(catalog.max_used),
     )
+
+
+def _state_tensors_for_node(
+    *,
+    nid: int,
+    sigma_idx: int,
+    cost_tables: Dict[int, CostTableEntry],
+    catalog: Optional[BoundaryStateCatalog],
+) -> Tuple[Tensor, Tensor]:
+    ct = cost_tables.get(nid)
+    if ct is not None and ct.state_used_iface is not None and ct.state_mate is not None:
+        return ct.state_used_iface[sigma_idx].detach().cpu(), ct.state_mate[sigma_idx].detach().cpu()
+    if catalog is None:
+        raise _ReconstructionError(f"missing state tensors for node {nid}, state {sigma_idx}")
+    return catalog.used_iface[sigma_idx], catalog.mate[sigma_idx]
 
 def _root_scale(tokens: PackedNodeTokens | SimpleNamespace) -> float:
     if hasattr(tokens, "root_scale_s") and torch.is_tensor(tokens.root_scale_s) and tokens.root_scale_s.numel() > 0:
@@ -278,7 +290,8 @@ def _validate_nonroot_witness(
     sigma_idx: int,
     witness: _NodeWitness,
     tokens: SimpleNamespace,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog],
+    cost_tables: Dict[int, CostTableEntry],
 ) -> None:
     if witness.closed_cycles:
         raise _ReconstructionError(
@@ -291,8 +304,12 @@ def _validate_nonroot_witness(
             },
         )
 
-    used = catalog.used_iface[sigma_idx]
-    mate = catalog.mate[sigma_idx]
+    used, mate = _state_tensors_for_node(
+        nid=nid,
+        sigma_idx=sigma_idx,
+        cost_tables=cost_tables,
+        catalog=catalog,
+    )
     iface_mask = tokens.iface_mask[nid].bool()
 
     expected_active = {
@@ -364,7 +381,7 @@ def _reconstruct_leaf_node(
     tokens: SimpleNamespace,
     leaves: SimpleNamespace,
     leaf_row_for_node: Tensor,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog],
     cost_tables: Dict[int, CostTableEntry],
     root_id: int,
 ) -> _NodeWitness:
@@ -375,13 +392,19 @@ def _reconstruct_leaf_node(
     point_mask = leaves.point_mask[row].bool()
     point_ids = leaves.point_idx[row][point_mask].long().tolist()
 
+    state_used, state_mate = _state_tensors_for_node(
+        nid=nid,
+        sigma_idx=sigma_idx,
+        cost_tables=cost_tables,
+        catalog=catalog,
+    )
     cost, witness = leaf_solve_state(
         points_xy=leaves.point_xy[row],
         point_mask=leaves.point_mask[row],
         iface_mask=tokens.iface_mask[nid],
         iface_feat6=tokens.iface_feat6[nid],
-        state_used=catalog.used_iface[sigma_idx],
-        state_mate=catalog.mate[sigma_idx],
+        state_used=state_used,
+        state_mate=state_mate,
         box_xy=tokens.tree_node_feat_rel[nid],
         is_root=(nid == root_id),
     )
@@ -408,6 +431,7 @@ def _reconstruct_leaf_node(
             witness=node_witness,
             tokens=tokens,
             catalog=catalog,
+            cost_tables=cost_tables,
         )
     return node_witness
 
@@ -419,7 +443,7 @@ def _reconstruct_node_witness(
     tokens: SimpleNamespace,
     leaves: SimpleNamespace,
     leaf_row_for_node: Tensor,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog],
     cost_tables: Dict[int, CostTableEntry],
     root_id: int,
 ) -> _NodeWitness:
@@ -588,6 +612,7 @@ def _reconstruct_node_witness(
             witness=node_witness,
             tokens=tokens,
             catalog=catalog,
+            cost_tables=cost_tables,
         )
     return node_witness
 
@@ -597,7 +622,7 @@ def reconstruct_tour_direct(
     result: OnePassDPResult,
     tokens: PackedNodeTokens,
     leaves: PackedLeafPoints,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog] = None,
 ) -> DirectTourResult:
     """Reconstruct an explicit tour directly from DP traceback witnesses."""
     if result.root_sigma < 0:
@@ -692,6 +717,4 @@ def reconstruct_tour_direct(
 __all__ = [
     "DirectTourResult",
     "reconstruct_tour_direct",
-    "dp_result_to_logits",
-    "dp_result_to_edge_scores",
 ]

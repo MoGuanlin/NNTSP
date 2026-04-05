@@ -43,7 +43,6 @@ import warnings
 import datetime
 import pickle
 import os
-import io
 import math
 from pathlib import Path
 from dataclasses import dataclass
@@ -59,6 +58,8 @@ from src.cli.model_factory import (
     inspect_twopass_resume_checkpoint,
     restore_twopass_checkpoint_state,
 )
+from src.cli.runtime_batch_io import deserialize_torch_payload, serialize_torch_payload
+from src.cli.teacher_lkh_args import add_teacher_lkh_args, build_spanner_teacher_labeler, teacher_lkh_config_from_args
 
 
 
@@ -114,9 +115,7 @@ class ValidationWorker:
         # We use it for num_workers > 1 to be safe on shared memory/FD limits,
         # but skip it for 0 or 1 to avoid unnecessary serialization overhead.
         if self.num_workers > 1:
-            buf = io.BytesIO()
-            torch.save(batch, buf)
-            return buf.getvalue()
+            return serialize_torch_payload(batch)
         else:
             return batch
 
@@ -150,9 +149,7 @@ class TrainingWorker:
         
         # Serialize to bytes to avoid shared memory issues with many small tensors
         if self.num_workers > 0:
-            buf = io.BytesIO()
-            torch.save(batch, buf)
-            return buf.getvalue()
+            return serialize_torch_payload(batch)
         else:
             return batch
 
@@ -166,14 +163,7 @@ def precompute_validation_batches(
     batches = []
     pbar = tqdm(total=len(val_loader), desc="[val] Pre-computing batches")
     for batch_raw in val_loader:
-        # If batch is bytes (from worker), deserialize it
-        if isinstance(batch_raw, bytes):
-            try:
-                batch = torch.load(io.BytesIO(batch_raw), map_location="cpu", weights_only=False)
-            except TypeError:
-                batch = torch.load(io.BytesIO(batch_raw), map_location="cpu")
-        else:
-            batch = batch_raw
+        batch = deserialize_torch_payload(batch_raw)
 
         # Keep pre-computed batch on CPU to save VRAM/RAM
         # We will move to device on-demand during validation
@@ -801,7 +791,7 @@ def run_validation(
             el_cpu = el.detach().cpu()
             tlen = float(teacher_len_tensor[b].item()) if b < teacher_len_tensor.numel() else 0.0
             
-            decode_tasks.append((pos_cpu, sp_edge_cpu, el_cpu, True, True, tlen))
+            decode_tasks.append((pos_cpu, sp_edge_cpu, el_cpu, True, tlen))
             
         t_cpu_accum += (time.time() - t_mid4)
 
@@ -901,14 +891,10 @@ def main() -> None:
     parser.add_argument("--no_shuffle", action="store_true", help="disable shuffling in training")
 
     # Teacher / labeler
-    parser.add_argument("--two_opt_passes", type=int, default=30, help="deprecated; ignored by spanner-LKH teacher generation")
-    parser.add_argument("--use_lkh", action="store_true", help="deprecated; teacher generation always uses LKH on the sparse spanner")
     parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH-3 executable")
-    parser.add_argument("--teacher_lkh_runs", type=int, default=1, help="number of LKH runs for sparse-spanner teacher generation")
-    parser.add_argument("--teacher_lkh_timeout", type=float, default=0.0, help="timeout in seconds for one sparse-spanner teacher solve (0 = disabled)")
+    add_teacher_lkh_args(parser)
 
     # Top-down decoder
-    parser.add_argument("--td_mode", type=str, default="two_stage", choices=["two_stage", "one_stage"])
     parser.add_argument("--state_mode", type=str, default="iface", choices=["iface", "matching"], help="boundary-condition state representation")
     parser.add_argument("--matching_max_used", type=int, default=4, help="max number of active interfaces enumerated in matching state catalog")
 
@@ -944,7 +930,6 @@ def main() -> None:
     from src.models.node_token_packer import NodeTokenPacker
     from src.models.bottom_up_runner import BottomUpTreeRunner
     from src.models.top_down_runner import TopDownTreeRunner
-    from src.models.labeler import PseudoLabeler
     from src.models.losses import dp_token_losses, masked_bce_with_logits, masked_ce_with_logits
     from src.dataprep.dataset import TSPDataset, FastTSPDataset, consolidate_data_list, smart_load_dataset
 
@@ -957,7 +942,6 @@ def main() -> None:
     model_bundle = build_twopass_training_models(
         device=device,
         r=int(args.r),
-        td_mode=str(args.td_mode),
         state_mode=str(args.state_mode),
         matching_max_used=int(args.matching_max_used),
         d_model=128,
@@ -969,14 +953,10 @@ def main() -> None:
     bu_runner = BottomUpTreeRunner()
     td_runner = TopDownTreeRunner()
 
-    labeler = PseudoLabeler(
-        two_opt_passes=int(args.two_opt_passes),
-        use_lkh=bool(args.use_lkh),
+    labeler = build_spanner_teacher_labeler(
         lkh_exe=str(args.lkh_exe),
+        config=teacher_lkh_config_from_args(args),
         prefer_cpu=True,
-        teacher_mode="spanner_lkh",
-        teacher_lkh_runs=int(args.teacher_lkh_runs),
-        teacher_lkh_timeout=(None if float(args.teacher_lkh_timeout) <= 0 else float(args.teacher_lkh_timeout)),
     )
     print(f"[teacher] using LKH executable: {labeler.lkh_exe}")
 
@@ -1110,14 +1090,7 @@ def main() -> None:
 
         pbar = tqdm(train_loader, desc=f"[train] Ep {epoch}/{args.epochs}")
         for i, batch_raw in enumerate(pbar):
-            # 1. Deserialize if needed
-            if isinstance(batch_raw, bytes):
-                try:
-                    batch = torch.load(io.BytesIO(batch_raw), map_location="cpu", weights_only=False)
-                except TypeError:
-                    batch = torch.load(io.BytesIO(batch_raw), map_location="cpu")
-            else:
-                batch = batch_raw
+            batch = deserialize_torch_payload(batch_raw)
 
             # 2. Move to device (packed and labels)
             packed = move_data_tensors_to_device(batch.packed, device)

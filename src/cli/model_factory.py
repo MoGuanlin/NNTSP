@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 
+TWOPASS_TD_MODE = "two_stage"
+
 
 @dataclass
 class TwoPassEvalModels:
@@ -29,10 +31,11 @@ class OnePassEvalModels:
     d_model: int
     matching_max_used: int
     num_iface_slots: int
+    decoder_variant: str
     leaf_encoder: Any
     merge_encoder: Any
     merge_decoder: Any
-    merge_decoder_loaded: bool
+    iface_order: str = "clockwise"
 
 
 @dataclass
@@ -51,9 +54,11 @@ class OnePassTrainingModels:
     d_model: int
     matching_max_used: int
     num_iface_slots: int
+    decoder_variant: str
     leaf_encoder: Any
     merge_encoder: Any
     merge_decoder: Any
+    iface_order: str = "clockwise"
 
 
 def _infer_twopass_num_states(*, r: int, state_mode: str, matching_max_used: int) -> Optional[int]:
@@ -67,7 +72,19 @@ def _infer_twopass_num_states(*, r: int, state_mode: str, matching_max_used: int
 def _detect_twopass_d_model(ckpt: Dict[str, Any]) -> int:
     if "leaf_encoder" in ckpt and "emb_type.weight" in ckpt["leaf_encoder"]:
         return int(ckpt["leaf_encoder"]["emb_type.weight"].shape[1])
-    return 128
+    raise KeyError(
+        "Checkpoint is missing leaf_encoder['emb_type.weight']; "
+        "unable to infer two-pass d_model from legacy/incomplete weights."
+    )
+
+
+def _require_ckpt_arg(ckpt_args: Dict[str, Any], key: str, *, ckpt_path: str) -> Any:
+    if key not in ckpt_args:
+        raise KeyError(
+            f"Checkpoint {ckpt_path} is missing args['{key}']. "
+            "This repo no longer guesses missing architecture fields from legacy checkpoints."
+        )
+    return ckpt_args[key]
 
 
 def inspect_twopass_resume_checkpoint(
@@ -80,9 +97,12 @@ def inspect_twopass_resume_checkpoint(
     ckpt_args = dict(ckpt.get("args", {}))
     log = emit if emit is not None else print
 
-    if "td_mode" in ckpt_args and str(args.td_mode) != str(ckpt_args["td_mode"]):
-        log(f"[ckpt] overriding td_mode: {args.td_mode} -> {ckpt_args['td_mode']}")
-        args.td_mode = ckpt_args["td_mode"]
+    td_mode = str(ckpt_args.get("td_mode", TWOPASS_TD_MODE))
+    if td_mode != TWOPASS_TD_MODE:
+        raise ValueError(
+            f"Checkpoint {ckpt_path} was trained with td_mode={td_mode!r}. "
+            f"Only td_mode={TWOPASS_TD_MODE!r} is still supported."
+        )
     if "state_mode" in ckpt_args and str(args.state_mode) != str(ckpt_args["state_mode"]):
         log(f"[ckpt] overriding state_mode: {args.state_mode} -> {ckpt_args['state_mode']}")
         args.state_mode = ckpt_args["state_mode"]
@@ -96,7 +116,6 @@ def build_twopass_training_models(
     *,
     device: torch.device,
     r: int,
-    td_mode: str,
     state_mode: str,
     matching_max_used: int,
     d_model: int = 128,
@@ -114,7 +133,6 @@ def build_twopass_training_models(
     merge_encoder = MergeEncoder(d_model=int(d_model)).to(device)
     decoder = TopDownDecoder(
         d_model=int(d_model),
-        mode=str(td_mode),
         state_mode=str(state_mode),
         num_states=num_states,
     ).to(device)
@@ -151,8 +169,10 @@ def build_onepass_training_models(
     d_model: int,
     r: int,
     matching_max_used: int,
+    decoder_variant: str,
     parent_num_layers: int,
     cross_num_layers: int,
+    iface_order: str = "clockwise",
 ) -> OnePassTrainingModels:
     from src.models.leaf_encoder import LeafEncoder
     from src.models.merge_decoder import MergeDecoder
@@ -165,6 +185,7 @@ def build_onepass_training_models(
         d_model=int(d_model),
         n_heads=max(4, int(d_model) // 32),
         num_iface_slots=num_iface_slots,
+        decoder_variant=str(decoder_variant),
         parent_num_layers=int(parent_num_layers),
         cross_num_layers=int(cross_num_layers),
         max_depth=64,
@@ -173,9 +194,11 @@ def build_onepass_training_models(
         d_model=int(d_model),
         matching_max_used=int(matching_max_used),
         num_iface_slots=num_iface_slots,
+        decoder_variant=str(decoder_variant),
         leaf_encoder=leaf_encoder,
         merge_encoder=merge_encoder,
         merge_decoder=merge_decoder,
+        iface_order=str(iface_order),
     )
 
 
@@ -187,27 +210,34 @@ def restore_onepass_checkpoint_state(
     merge_decoder: Any,
     opt: Any | None = None,
     load_optimizer: bool = False,
-) -> bool:
+) -> None:
     leaf_encoder.load_state_dict(ckpt["leaf_encoder"])
     merge_encoder.load_state_dict(ckpt["merge_encoder"])
-    merge_decoder_loaded = "merge_decoder" in ckpt
-    if merge_decoder_loaded:
-        merge_decoder.load_state_dict(ckpt["merge_decoder"])
+    if "merge_decoder" not in ckpt:
+        raise KeyError(
+            "Checkpoint is missing 'merge_decoder'. "
+            "Legacy decoder-less 1-pass checkpoints are no longer supported."
+        )
+    merge_decoder.load_state_dict(ckpt["merge_decoder"])
     if load_optimizer and opt is not None and "opt" in ckpt:
         opt.load_state_dict(ckpt["opt"])
-    return merge_decoder_loaded
 
 
 def load_twopass_eval_models(*, ckpt_path: str, device: torch.device, r: int) -> TwoPassEvalModels:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     d_model = _detect_twopass_d_model(ckpt)
-    ckpt_args = ckpt.get("args", {})
-    state_mode = str(ckpt_args.get("state_mode", "iface"))
-    matching_max_used = int(ckpt_args.get("matching_max_used", 4))
+    ckpt_args = dict(ckpt.get("args", {}))
+    td_mode = str(ckpt_args.get("td_mode", TWOPASS_TD_MODE))
+    if td_mode != TWOPASS_TD_MODE:
+        raise ValueError(
+            f"Checkpoint {ckpt_path} was trained with td_mode={td_mode!r}. "
+            f"Only td_mode={TWOPASS_TD_MODE!r} is still supported."
+        )
+    state_mode = str(_require_ckpt_arg(ckpt_args, "state_mode", ckpt_path=ckpt_path))
+    matching_max_used = int(_require_ckpt_arg(ckpt_args, "matching_max_used", ckpt_path=ckpt_path))
     models = build_twopass_training_models(
         device=device,
         r=int(r),
-        td_mode=str(ckpt_args.get("td_mode", "two_stage")),
         state_mode=state_mode,
         matching_max_used=matching_max_used,
         d_model=d_model,
@@ -239,21 +269,28 @@ def load_onepass_eval_models(
     ckpt_path: str,
     device: torch.device,
     r: int,
-    default_matching_max_used: int,
 ) -> OnePassEvalModels:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    ckpt_args = ckpt.get("args", {})
-    d_model = int(ckpt_args.get("d_model", 128))
-    matching_max_used = int(ckpt_args.get("matching_max_used", default_matching_max_used))
+    ckpt_args = dict(ckpt.get("args", {}))
+    d_model = int(_require_ckpt_arg(ckpt_args, "d_model", ckpt_path=ckpt_path))
+    matching_max_used = int(_require_ckpt_arg(ckpt_args, "matching_max_used", ckpt_path=ckpt_path))
+    decoder_variant = str(ckpt_args.get("decoder_variant", "iface"))
+    if "iface_order" in ckpt_args:
+        iface_order = str(ckpt_args["iface_order"])
+    else:
+        supervision_mode = str(ckpt_args.get("supervision_mode", "catalog_index"))
+        iface_order = "legacy" if supervision_mode == "direct_structured" else "clockwise"
     models = build_onepass_training_models(
         device=device,
         d_model=d_model,
         r=int(r),
         matching_max_used=matching_max_used,
-        parent_num_layers=int(ckpt_args.get("parent_num_layers", 3)),
-        cross_num_layers=int(ckpt_args.get("cross_num_layers", 2)),
+        decoder_variant=decoder_variant,
+        parent_num_layers=int(_require_ckpt_arg(ckpt_args, "parent_num_layers", ckpt_path=ckpt_path)),
+        cross_num_layers=int(_require_ckpt_arg(ckpt_args, "cross_num_layers", ckpt_path=ckpt_path)),
+        iface_order=iface_order,
     )
-    merge_decoder_loaded = restore_onepass_checkpoint_state(
+    restore_onepass_checkpoint_state(
         ckpt=ckpt,
         leaf_encoder=models.leaf_encoder,
         merge_encoder=models.merge_encoder,
@@ -268,10 +305,11 @@ def load_onepass_eval_models(
         d_model=d_model,
         matching_max_used=matching_max_used,
         num_iface_slots=models.num_iface_slots,
+        decoder_variant=decoder_variant,
         leaf_encoder=models.leaf_encoder,
         merge_encoder=models.merge_encoder,
         merge_decoder=models.merge_decoder,
-        merge_decoder_loaded=merge_decoder_loaded,
+        iface_order=iface_order,
     )
 
 

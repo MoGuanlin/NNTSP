@@ -7,8 +7,6 @@ import argparse
 import contextlib
 import io
 import json
-import shutil
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +16,7 @@ import numpy as np
 import torch
 
 from src.cli.common import load_dataset, log_progress, move_data_tensors_to_device, parse_bool_arg, resolve_device
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
 from src.cli.graph_pipeline import (
     build_spanner_builder,
     preprocess_points_to_hierarchy,
@@ -28,19 +27,10 @@ from src.graph.build_raw_pyramid import RawPyramidBuilder
 from src.models.bottom_up_runner import BottomUpTreeRunner
 from src.models.decode_backend import decode_tour
 from src.models.edge_aggregation import aggregate_logits_to_edges
-from src.models.lkh_decode import LKHDecodeResult, build_guided_candidates
+from src.models.lkh_decode import GuidedLKHConfig, LKHDecodeResult, build_guided_candidates, run_candidate_lkh_timed
 from src.models.node_token_packer import NodeTokenPacker
 from src.models.top_down_runner import TopDownTreeRunner
-from src.utils.lkh_solver import (
-    default_lkh_executable,
-    parse_tour,
-    resolve_lkh_executable,
-    run_lkh,
-    write_candidate_file,
-    write_par,
-    write_tour_file,
-    write_tsp_euc2d,
-)
+from src.utils.lkh_solver import default_lkh_executable, resolve_lkh_executable
 
 
 def resolve_synthetic_raw_data_path(*, synthetic_n: int, synthetic_data_root: str) -> str:
@@ -114,74 +104,19 @@ def run_guided_lkh_timed(
     num_runs: int,
     seed: int,
     timeout: float | None,
+    guided_config: GuidedLKHConfig | None = None,
 ) -> tuple[LKHDecodeResult, Dict[str, float]]:
-    pos_cpu = pos.detach().cpu()
-    pos_np = pos_cpu.numpy()
-
-    tmp_dir = tempfile.mkdtemp(prefix="timed_guided_lkh_")
-    tsp_path = str(Path(tmp_dir) / "problem.tsp")
-    par_path = str(Path(tmp_dir) / "config.par")
-    tour_path = str(Path(tmp_dir) / "result.tour")
-    cand_path = str(Path(tmp_dir) / "candidates.cand")
-    init_tour_path = str(Path(tmp_dir) / "initial.itour")
-
-    setup_t0 = time.perf_counter()
-    try:
-        write_tsp_euc2d(tsp_path, "GuidedTSP", pos_np)
-        write_candidate_file(cand_path, int(pos_cpu.shape[0]), list(candidates))
-
-        init_p = None
-        if initial_tour is not None:
-            write_tour_file(init_tour_path, [int(x) for x in initial_tour])
-            init_p = init_tour_path
-
-        write_par(
-            par_path,
-            tsp_path,
-            tour_path,
-            runs=max(1, int(num_runs)),
-            seed=int(seed),
-            precision=1,
-            candidate_path=cand_path,
-            initial_tour_path=init_p,
-            subgradient=False,
-            max_candidates=5,
-            max_trials=1,
-        )
-        setup_sec = time.perf_counter() - setup_t0
-
-        search_t0 = time.perf_counter()
-        ok = run_lkh(lkh_executable, par_path, timeout=timeout)
-        search_sec = time.perf_counter() - search_t0
-
-        parse_t0 = time.perf_counter()
-        order = parse_tour(tour_path) if ok else []
-        feasible = len(order) == int(pos_cpu.shape[0]) and len(set(order)) == int(pos_cpu.shape[0])
-        length = float("inf")
-        if feasible:
-            total = 0.0
-            n = len(order)
-            for i in range(n):
-                u = order[i]
-                v = order[(i + 1) % n]
-                total += float(np.linalg.norm(pos_np[u] - pos_np[v]))
-            length = total
-        parse_sec = time.perf_counter() - parse_t0
-
-        result = LKHDecodeResult(
-            order=order,
-            length=length,
-            feasible=feasible,
-            mode="guided",
-            duration=setup_sec + search_sec + parse_sec,
-        )
-        return result, {
-            "lkh_setup_io_sec": float(setup_sec),
-            "lkh_search_sec": float(search_sec),
-            "lkh_parse_sec": float(parse_sec),
-        }
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return run_candidate_lkh_timed(
+        pos=pos,
+        candidates=candidates,
+        initial_tour=initial_tour,
+        lkh_executable=lkh_executable,
+        num_runs=num_runs,
+        seed=seed,
+        timeout=timeout,
+        mode="guided",
+        candidate_config=guided_config,
+    )
 
 
 def summarize_records(records: List[Dict[str, Any]], *, stage_keys: List[str]) -> Dict[str, Any]:
@@ -257,7 +192,7 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--lkh_exe", type=str, default=default_lkh_executable(), help="path to LKH executable")
     parser.add_argument("--lkh_runs", type=int, default=1, help="number of LKH runs")
     parser.add_argument("--lkh_timeout", type=float, default=0.0, help="timeout in seconds for LKH; 0 disables timeout")
-    parser.add_argument("--guided_top_k", type=int, default=20, help="top-k NN candidate neighbors per node for guided LKH")
+    add_guided_lkh_args(parser)
     parser.add_argument("--num_workers", type=int, default=1, help="workers used by spanner builder when timing that stage")
     parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
     parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
@@ -276,6 +211,7 @@ def main(argv: List[str] | None = None) -> None:
         )
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     print(f"[env] device={device}")
     dataset = load_points_dataset(str(data_pt))
     total_samples = get_num_samples(dataset)
@@ -415,7 +351,6 @@ def main(argv: List[str] | None = None) -> None:
             spanner_edge_index=data_dev.spanner_edge_index.detach().cpu(),
             edge_logit=el.detach().cpu(),
             backend="greedy",
-            prefer_spanner_only=True,
             allow_off_spanner_patch=True,
         )
         warm_start_sec = time.perf_counter() - warm_t0
@@ -425,8 +360,8 @@ def main(argv: List[str] | None = None) -> None:
             num_nodes=int(data_dev.pos.shape[0]),
             edge_index=data_dev.spanner_edge_index.detach().cpu(),
             edge_logit=el.detach().cpu(),
-            logit_scale=1e3,
-            top_k=int(args.guided_top_k),
+            logit_scale=float(guided_config.logit_scale),
+            top_k=int(guided_config.top_k),
         )
         candidate_construction_sec = time.perf_counter() - cand_t0
 
@@ -438,6 +373,7 @@ def main(argv: List[str] | None = None) -> None:
             num_runs=int(args.lkh_runs),
             seed=1234,
             timeout=lkh_timeout,
+            guided_config=guided_config,
         )
 
         score_agg_candidate_sec = (
@@ -521,7 +457,14 @@ def main(argv: List[str] | None = None) -> None:
             "device": str(device),
             "r": int(args.r),
             "use_iface_in_decode": bool(args.use_iface_in_decode),
-            "guided_top_k": int(args.guided_top_k),
+            "guided_lkh": {
+                "top_k": int(guided_config.top_k),
+                "logit_scale": float(guided_config.logit_scale),
+                "subgradient": bool(guided_config.subgradient),
+                "max_candidates": guided_config.max_candidates,
+                "max_trials": guided_config.max_trials,
+                "use_initial_tour": bool(guided_config.use_initial_tour),
+            },
             "spanner_mode": str(args.spanner_mode),
             "theta_k": int(args.theta_k),
             "patching_mode": str(args.patching_mode),

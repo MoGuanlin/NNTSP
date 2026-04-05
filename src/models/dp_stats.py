@@ -11,7 +11,9 @@ def new_depth_stats_bucket() -> Dict[str, float]:
     return {
         "num_internal_nodes": 0.0,
         "num_sigma_total": 0.0,
+        "num_sigma_pruned_lb": 0.0,
         "num_parse_ok": 0.0,
+        "num_widening_ok": 0.0,
         "num_topk_ok": 0.0,
         "num_fallback": 0.0,
         "num_infeasible": 0.0,

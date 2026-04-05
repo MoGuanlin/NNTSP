@@ -1,4 +1,4 @@
-# src/cli/evaluate_tsplib_hierarchy_ablation.py
+# src/experiments/evaluate_tsplib_hierarchy_ablation.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import shutil
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +15,7 @@ import numpy as np
 import torch
 
 from src.cli.common import log_progress, resolve_device
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
 from src.cli.graph_pipeline import (
     build_spanner_builder,
     preprocess_points_to_hierarchy,
@@ -30,7 +29,7 @@ from src.cli.evaluate_tsplib import (
     sanitize_tag,
     select_tsplib_files,
 )
-from src.cli.evaluate_tsplib_compare import (
+from src.experiments.evaluate_tsplib_compare import (
     SHARED_TIMING_KEYS,
     compute_gap_pct,
     metric_entry,
@@ -40,10 +39,14 @@ from src.cli.evaluate_tsplib_compare import (
 from src.cli.model_factory import load_twopass_eval_models
 from src.graph.build_raw_pyramid import RawPyramidBuilder
 from src.models.bottom_up_runner import BottomUpTreeRunner
-from src.models.lkh_decode import TSPLIB_PAPER_RESULTS, build_uniform_spanner_candidates, solve_with_lkh_parallel
+from src.models.lkh_decode import (
+    TSPLIB_PAPER_RESULTS,
+    CandidateLKHConfig,
+    build_uniform_spanner_candidates,
+    run_candidate_lkh_timed,
+)
 from src.models.node_token_packer import NodeTokenPacker
 from src.models.top_down_runner import TopDownTreeRunner
-from src.utils.lkh_solver import parse_tour, run_lkh, write_candidate_file, write_par, write_tsp_euc2d, write_tour_file
 
 
 def utc_now_iso() -> str:
@@ -73,69 +76,37 @@ def run_spanner_uniform_instance(
     initial_tour: List[int] | None = None,
 ) -> Dict[str, Any]:
     pos_cpu = points_cpu.detach().cpu()
-    pos_np = pos_cpu.numpy()
     edge_index_cpu = spanner_edge_index.detach().cpu()
 
-    tmp_dir = tempfile.mkdtemp(prefix="spanner_uniform_candidate_only_")
-    tsp_path = str(Path(tmp_dir) / "problem.tsp")
-    par_path = str(Path(tmp_dir) / "config.par")
-    tour_path = str(Path(tmp_dir) / "result.tour")
-    cand_path = str(Path(tmp_dir) / "candidates.cand")
-    init_tour_path = str(Path(tmp_dir) / "initial.itour")
-
     start_t = time.perf_counter()
-    try:
-        write_tsp_euc2d(tsp_path, "SpannerUniformConstrained", pos_np)
-        candidates = build_uniform_spanner_candidates(
-            num_nodes=int(pos_cpu.shape[0]),
-            edge_index=edge_index_cpu,
-            uniform_alpha=0,
-        )
-        write_candidate_file(cand_path, int(pos_cpu.shape[0]), list(candidates))
-
-        init_p = None
-        if initial_tour is not None:
-            write_tour_file(init_tour_path, [int(x) for x in initial_tour])
-            init_p = init_tour_path
-
-        # This baseline should differ only in the allowed edge set / lack of learned ranking.
-        # Keep LKH's own search machinery enabled, while forcing it to stay inside the
-        # provided candidate graph.
-        write_par(
-            par_path,
-            tsp_path,
-            tour_path,
-            runs=max(1, int(lkh_runs)),
-            seed=1234,
-            precision=1,
-            candidate_path=cand_path,
-            initial_tour_path=init_p,
+    candidates = build_uniform_spanner_candidates(
+        num_nodes=int(pos_cpu.shape[0]),
+        edge_index=edge_index_cpu,
+        uniform_alpha=0,
+    )
+    result, _ = run_candidate_lkh_timed(
+        pos=pos_cpu,
+        candidates=candidates,
+        initial_tour=initial_tour,
+        lkh_executable=lkh_exe,
+        num_runs=max(1, int(lkh_runs)),
+        seed=1234,
+        timeout=lkh_timeout,
+        mode="spanner_uniform",
+        candidate_config=CandidateLKHConfig(
             subgradient=True,
             max_candidates=0,
             max_trials=None,
-        )
-
-        ok = run_lkh(lkh_exe, par_path, timeout=lkh_timeout)
-        order = parse_tour(tour_path) if ok else []
-        feasible = len(order) == int(pos_cpu.shape[0]) and len(set(order)) == int(pos_cpu.shape[0])
-        if feasible:
-            total = 0.0
-            n = len(order)
-            for i in range(n):
-                u = int(order[i])
-                v = int(order[(i + 1) % n])
-                total += float(np.linalg.norm(pos_np[u] - pos_np[v]))
-            euclidean_length = total
-            obj = tsplib_euc2d_length(coords_np, list(order))
-        else:
-            euclidean_length = None
-            obj = None
-    finally:
-        duration = time.perf_counter() - start_t
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            use_initial_tour=True,
+        ),
+    )
+    duration = time.perf_counter() - start_t
+    order = list(result.order)
+    obj = tsplib_euc2d_length(coords_np, order) if result.feasible else None
+    euclidean_length = float(result.length) if result.feasible else None
 
     return metric_entry(
-        feasible=bool(obj is not None),
+        feasible=bool(result.feasible),
         obj=obj,
         euclidean_length=(None if euclidean_length is None else float(euclidean_length)),
         order=(list(order) if obj is not None else None),
@@ -243,7 +214,7 @@ def summarize(records: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[s
 
 
 def main(argv: List[str] | None = None) -> None:
-    from src.utils.lkh_solver import default_lkh_executable
+    from src.utils.lkh_solver import default_lkh_executable, resolve_lkh_executable
 
     parser = argparse.ArgumentParser(
         description="Hierarchy ablation on TSPLIB: compare 2-pass guided LKH with spanner+uniform LKH."
@@ -255,7 +226,7 @@ def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--num_instances", type=int, default=5)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--r", type=int, default=4)
-    parser.add_argument("--guided_top_k", type=int, default=20)
+    add_guided_lkh_args(parser)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
     parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
@@ -269,7 +240,10 @@ def main(argv: List[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
+    lkh_exe = resolve_lkh_executable(str(args.lkh_exe))
     print(f"[env] device={device}")
+    print(f"[env] lkh_exe={lkh_exe}")
 
     explicit_instances = parse_instance_name_list(args.instances)
     if explicit_instances:
@@ -334,12 +308,19 @@ def main(argv: List[str] | None = None) -> None:
         "instances": instance_names,
         "r": int(args.r),
         "device": str(device),
-        "guided_top_k": int(args.guided_top_k),
+        "guided_lkh": {
+            "top_k": int(guided_config.top_k),
+            "logit_scale": float(guided_config.logit_scale),
+            "subgradient": bool(guided_config.subgradient),
+            "max_candidates": guided_config.max_candidates,
+            "max_trials": guided_config.max_trials,
+            "use_initial_tour": bool(guided_config.use_initial_tour),
+        },
         "num_workers": int(args.num_workers),
         "spanner_mode": str(args.spanner_mode),
         "theta_k": int(args.theta_k),
         "patching_mode": str(args.patching_mode),
-        "lkh_exe": str(Path(args.lkh_exe).resolve()),
+        "lkh_exe": str(lkh_exe),
         "lkh_runs": int(args.lkh_runs),
         "lkh_timeout": args.lkh_timeout,
         "state_mode": model_bundle.state_mode,
@@ -393,8 +374,8 @@ def main(argv: List[str] | None = None) -> None:
             bu_runner=bu_runner,
             td_runner=td_runner,
             use_iface_in_decode=str(args.use_iface_in_decode).strip().lower() not in {"0", "false", "no"},
-            guided_top_k=int(args.guided_top_k),
-            lkh_exe=str(args.lkh_exe),
+            guided_config=guided_config,
+            lkh_exe=str(lkh_exe),
             lkh_runs=int(args.lkh_runs),
             lkh_timeout=args.lkh_timeout,
             optimum=paper_obj,
@@ -406,7 +387,7 @@ def main(argv: List[str] | None = None) -> None:
             points_cpu=points_cpu,
             spanner_edge_index=patched_edge_index,
             coords_np=coords,
-            lkh_exe=str(args.lkh_exe),
+            lkh_exe=str(lkh_exe),
             lkh_runs=int(args.lkh_runs),
             lkh_timeout=args.lkh_timeout,
             paper_obj=paper_obj,

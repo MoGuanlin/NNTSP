@@ -8,7 +8,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.cli.evaluate_tsplib import select_tsplib_files
-from src.cli.evaluate_tsplib_compare import load_tsplib_optima, tsplib_euc2d_length
+from src.experiments.evaluate_tsplib_compare import load_tsplib_optima, tsplib_euc2d_length
 
 
 def test_n100_500_preset_selects_expected_range():

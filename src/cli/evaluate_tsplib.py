@@ -17,6 +17,18 @@ import numpy as np
 import torch
 
 from src.cli.common import log_progress, move_data_tensors_to_device as to_device, resolve_device
+from src.cli.guided_lkh_args import add_guided_lkh_args, guided_lkh_config_from_args
+from src.cli.eval_profiles import (
+    TSPLIB_AVAILABLE_SETTINGS as AVAILABLE_SETTINGS,
+    TSPLIB_DEFAULT_SETTINGS as DEFAULT_SETTINGS,
+    TSPLIB_SETTING_ALIASES as SETTING_ALIASES,
+    TSPLIB_SETTING_GROUPS as SETTING_GROUPS,
+)
+from src.cli.eval_task_factory import (
+    build_lkh_task,
+    mask_edge_logits_with_coverage,
+    prepare_decode_inputs,
+)
 from src.cli.eval_settings import describe_settings, resolve_eval_settings
 from src.cli.graph_pipeline import (
     build_spanner_builder,
@@ -40,49 +52,6 @@ TSPLIB_INSTANCE_PRESETS = {
     "small100_500": {"mode": "range", "min_n": 100, "max_n": 500},
     "paper": {"mode": "names", "names": tuple(TSPLIB_PAPER_RESULTS.keys())},
     "all": {"mode": "all"},
-}
-
-
-AVAILABLE_SETTINGS = (
-    "greedy",
-    "exact",
-    "spanner_uniform_lkh",
-    "guided_lkh",
-    "pomo",
-    "neurolkh",
-    "paper_lkh",
-)
-
-DEFAULT_SETTINGS = (
-    "greedy",
-    "guided_lkh",
-    "pomo",
-    "neurolkh",
-    "paper_lkh",
-)
-
-SETTING_GROUPS = {
-    "default": DEFAULT_SETTINGS,
-    "all": ("greedy", "exact", "spanner_uniform_lkh", "guided_lkh", "pomo", "neurolkh", "paper_lkh"),
-    "ours": ("greedy", "exact", "guided_lkh"),
-    "baselines": ("pomo", "neurolkh"),
-    "reference": ("paper_lkh",),
-    "lkh": ("spanner_uniform_lkh", "guided_lkh", "paper_lkh"),
-    "practical_lkh": ("spanner_uniform_lkh", "guided_lkh", "paper_lkh"),
-}
-
-SETTING_ALIASES = {
-    "spanner": "spanner_uniform_lkh",
-    "spanner_only": "spanner_uniform_lkh",
-    "spanner_lkh": "spanner_uniform_lkh",
-    "uniform_lkh": "spanner_uniform_lkh",
-    "guided": "guided_lkh",
-    "guidedlkh": "guided_lkh",
-    "paper": "paper_lkh",
-    "pure": "paper_lkh",
-    "ref": "paper_lkh",
-    "reference_lkh": "paper_lkh",
-    "ex": "exact",
 }
 
 SETTING_COLUMNS: Dict[str, List[tuple[str, str, int]]] = {
@@ -464,14 +433,13 @@ def main(argv: List[str] | None = None):
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--r", type=int, default=4)
     parser.add_argument("--lkh_exe", type=str, default=default_lkh, help="path to LKH executable")
-    parser.add_argument("--skip_guided_lkh", action="store_true", help="legacy flag: remove guided_lkh from selected settings")
+    add_guided_lkh_args(parser)
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--spanner_mode", type=str, default="delaunay", choices=("delaunay", "theta"))
     parser.add_argument("--theta_k", type=int, default=14, help="theta spanner cone count when --spanner_mode theta")
     parser.add_argument("--patching_mode", type=str, default="prune", choices=("prune", "arora"))
     parser.add_argument("--pomo_ckpt", type=str, default=None, help="path to POMO checkpoint")
     parser.add_argument("--neurolkh_ckpt", type=str, default=None, help="path to NeuroLKH checkpoint")
-    parser.add_argument("--run_exact", action="store_true", help="legacy flag: add exact to selected settings")
     parser.add_argument("--exact_time_limit", type=float, default=30.0, help="time limit in seconds for exact sparse decoding")
     parser.add_argument("--exact_length_weight", type=float, default=0.0, help="optional Euclidean tie-break weight for exact sparse decoding")
     parser.add_argument("--save_dir", type=str, default="outputs/eval_tsplib", help="directory for per-instance appended TSPLIB results")
@@ -502,12 +470,11 @@ def main(argv: List[str] | None = None):
         default=DEFAULT_SETTINGS,
         aliases=SETTING_ALIASES,
         groups=SETTING_GROUPS,
-        enable_exact=bool(args.run_exact),
-        disable_guided_lkh=bool(args.skip_guided_lkh),
     )
     print(f"[eval] selected settings: {', '.join(selected_settings)}")
 
     device = resolve_device(str(args.device))
+    guided_config = guided_lkh_config_from_args(args)
     print(f"[env] device={device}")
 
     print(f"[ckpt] loading from {args.ckpt}")
@@ -594,6 +561,14 @@ def main(argv: List[str] | None = None):
         "spanner_mode": str(args.spanner_mode),
         "theta_k": int(args.theta_k),
         "patching_mode": str(args.patching_mode),
+        "guided_lkh": {
+            "top_k": int(guided_config.top_k),
+            "logit_scale": float(guided_config.logit_scale),
+            "subgradient": bool(guided_config.subgradient),
+            "max_candidates": guided_config.max_candidates,
+            "max_trials": guided_config.max_trials,
+            "use_initial_tour": bool(guided_config.use_initial_tour),
+        },
         "selected_settings": selected_settings,
         "state_mode": state_mode,
         "matching_max_used": matching_max_used,
@@ -723,9 +698,10 @@ def main(argv: List[str] | None = None):
                 reduce="mean",
                 num_edges=data_cuda.spanner_edge_index.shape[1],
             )
-            el = edge_scores.edge_logit.clone()
-            em = edge_scores.edge_mask.bool()
-            el[~em] = -1e9
+            el = mask_edge_logits_with_coverage(
+                edge_scores.edge_logit,
+                edge_scores.edge_mask,
+            )
         log_progress(
             prefix,
             "inference done: "
@@ -737,16 +713,20 @@ def main(argv: List[str] | None = None):
 
         paper_res = TSPLIB_PAPER_RESULTS.get(name)
         teacher_len = paper_res["obj"] if paper_res else None
+        pos_cpu, sp_edge_cpu, el_cpu = prepare_decode_inputs(
+            pos=data_cuda.pos,
+            spanner_edge_index=data_cuda.spanner_edge_index,
+            edge_logit=el,
+        )
 
         greedy_res = None
         if need_greedy:
             log_progress(prefix, "start greedy decode...")
             greedy_res = decode_tour(
-                pos=data_cuda.pos.cpu(),
-                spanner_edge_index=data_cuda.spanner_edge_index.cpu(),
-                edge_logit=el.cpu(),
+                pos=pos_cpu,
+                spanner_edge_index=sp_edge_cpu,
+                edge_logit=el_cpu,
                 backend="greedy",
-                prefer_spanner_only=True,
                 allow_off_spanner_patch=True,
             )
             if "greedy" in selected_settings and greedy_res.feasible:
@@ -760,9 +740,9 @@ def main(argv: List[str] | None = None):
         if "exact" in selected_settings:
             log_progress(prefix, f"start exact sparse decode (time_limit={float(args.exact_time_limit):.1f}s)...")
             exact_res = decode_tour(
-                pos=data_cuda.pos.cpu(),
-                spanner_edge_index=data_cuda.spanner_edge_index.cpu(),
-                edge_logit=el.cpu(),
+                pos=pos_cpu,
+                spanner_edge_index=sp_edge_cpu,
+                edge_logit=el_cpu,
                 backend="exact",
                 exact_time_limit=float(args.exact_time_limit),
                 exact_length_weight=float(args.exact_length_weight),
@@ -777,16 +757,17 @@ def main(argv: List[str] | None = None):
 
         if "spanner_uniform_lkh" in selected_settings:
             log_progress(prefix, "start spanner-only LKH...")
-            spanner_lkh_task = {
-                "pos": data_cuda.pos.cpu(),
-                "mode": "spanner_uniform",
-                "edge_index": select_effective_edge_index(data_cuda),
-                "teacher_len": teacher_len if teacher_len else 0.0,
-            }
+            spanner_lkh_task = build_lkh_task(
+                pos=data_cuda.pos,
+                mode="spanner_uniform",
+                edge_index=select_effective_edge_index(data_cuda),
+                teacher_len=teacher_len if teacher_len else 0.0,
+            )
             spanner_res, _ = solve_with_lkh_parallel(
                 [spanner_lkh_task],
                 lkh_executable=args.lkh_exe,
                 num_workers=args.num_workers,
+                guided_config=guided_config,
             )[0]
             if spanner_res.feasible:
                 metrics["spanner_uniform_lkh"] = format_result_triplet(
@@ -801,18 +782,23 @@ def main(argv: List[str] | None = None):
 
         if "guided_lkh" in selected_settings:
             log_progress(prefix, "start guided LKH...")
-            lkh_task = {
-                "pos": data_cuda.pos.cpu(),
-                "mode": "guided",
-                "edge_index": data_cuda.spanner_edge_index.cpu(),
-                "edge_logit": el.cpu(),
-                "teacher_len": teacher_len if teacher_len else 0.0,
-                "initial_tour": greedy_res.order if greedy_res is not None and greedy_res.feasible else None,
-            }
+            lkh_task = build_lkh_task(
+                pos=data_cuda.pos,
+                mode="guided",
+                edge_index=data_cuda.spanner_edge_index,
+                edge_logit=el,
+                teacher_len=teacher_len if teacher_len else 0.0,
+                initial_tour=(
+                    greedy_res.order
+                    if greedy_res is not None and greedy_res.feasible
+                    else None
+                ),
+            )
             guided_res, _ = solve_with_lkh_parallel(
                 [lkh_task],
                 lkh_executable=args.lkh_exe,
                 num_workers=args.num_workers,
+                guided_config=guided_config,
             )[0]
             if guided_res.feasible:
                 metrics["guided_lkh"] = format_result_triplet(
@@ -882,16 +868,19 @@ def main(argv: List[str] | None = None):
                 )
 
                 nlkh_lkh_task = {
-                    "pos": data_cuda.pos.cpu(),
-                    "mode": "guided",
-                    "edge_index": nlkh_sp_index.cpu(),
-                    "edge_logit": nlkh_edge_logit.view(-1).cpu(),
-                    "teacher_len": teacher_len or 0.0,
+                    **build_lkh_task(
+                        pos=data_cuda.pos,
+                        mode="guided",
+                        edge_index=nlkh_sp_index,
+                        edge_logit=nlkh_edge_logit.view(-1),
+                        teacher_len=teacher_len or 0.0,
+                    )
                 }
                 nlkh_res, _ = solve_with_lkh_parallel(
                     [nlkh_lkh_task],
                     lkh_executable=args.lkh_exe,
                     num_workers=args.num_workers,
+                    guided_config=guided_config,
                 )[0]
                 if nlkh_res.feasible:
                     metrics["neurolkh"] = format_result_triplet(

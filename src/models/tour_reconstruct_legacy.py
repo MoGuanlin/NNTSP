@@ -60,11 +60,26 @@ def _collect_internal_states(
             queue.append((cid, c_si))
 
 
+def _state_used_for_node(
+    *,
+    nid: int,
+    sigma_idx: int,
+    cost_tables: Dict[int, CostTableEntry],
+    catalog: Optional[BoundaryStateCatalog],
+) -> Tensor:
+    ct = cost_tables.get(nid)
+    if ct is not None and ct.state_used_iface is not None:
+        return ct.state_used_iface[sigma_idx]
+    if catalog is None:
+        raise RuntimeError(f"missing state tensor for node {nid}, state {sigma_idx}")
+    return catalog.used_iface[sigma_idx]
+
+
 def dp_result_to_logits(
     *,
     result: OnePassDPResult,
     tokens: PackedNodeTokens,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Convert DP result to per-node iface/cross logits."""
     m = int(tokens.iface_mask.shape[0])
@@ -91,7 +106,12 @@ def dp_result_to_logits(
     for nid, si in node_states.items():
         if si < 0:
             continue
-        a = catalog.used_iface[si]
+        a = _state_used_for_node(
+            nid=nid,
+            sigma_idx=si,
+            cost_tables=result.cost_tables,
+            catalog=catalog,
+        )
         mask = tokens.iface_mask[nid].bool()
         for slot in range(ti):
             if not mask[slot].item():
@@ -134,14 +154,28 @@ def dp_result_to_logits(
             for s in range(ti):
                 if (tokens.iface_eid[cid_i, s].item() == cross_eid
                         and tokens.iface_mask[cid_i, s].bool().item()):
-                    active_i = bool(catalog.used_iface[si_i, s].item())
+                    active_i = bool(
+                        _state_used_for_node(
+                            nid=cid_i,
+                            sigma_idx=si_i,
+                            cost_tables=result.cost_tables,
+                            catalog=catalog,
+                        )[s].item()
+                    )
                     break
 
             active_j = False
             for s in range(ti):
                 if (tokens.iface_eid[cid_j, s].item() == cross_eid
                         and tokens.iface_mask[cid_j, s].bool().item()):
-                    active_j = bool(catalog.used_iface[si_j, s].item())
+                    active_j = bool(
+                        _state_used_for_node(
+                            nid=cid_j,
+                            sigma_idx=si_j,
+                            cost_tables=result.cost_tables,
+                            catalog=catalog,
+                        )[s].item()
+                    )
                     break
 
             if active_i and active_j:
@@ -154,7 +188,7 @@ def dp_result_to_edge_scores(
     *,
     result: OnePassDPResult,
     tokens: PackedNodeTokens,
-    catalog: BoundaryStateCatalog,
+    catalog: Optional[BoundaryStateCatalog] = None,
     num_edges: Optional[int] = None,
 ) -> EdgeScores:
     """Convert DP result to spanner edge scores for legacy post-decoding baselines."""

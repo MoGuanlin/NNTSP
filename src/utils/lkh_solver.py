@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-from typing import List, Optional, Tuple
+import time
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 
@@ -65,6 +67,13 @@ def resolve_lkh_executable(executable: Optional[str] = None) -> str:
 def default_lkh_executable() -> str:
     """Best-effort default LKH path for CLI defaults."""
     return resolve_lkh_executable("LKH")
+
+
+@dataclass(frozen=True)
+class LKHRunStatus:
+    ok: bool
+    timeout_hit: bool
+    elapsed_sec: float
 
 def write_tsp_euc2d(path: str, name: str, pos: np.ndarray):
     """Write a TSPLIB file in EUC_2D format."""
@@ -144,10 +153,68 @@ def write_tour_file(path: str, order: List[int]):
         f.write("-1\n")
         f.write("EOF\n")
 
-def run_lkh(executable: str, par_path: str, timeout: Optional[float] = None):
-    """Execute LKH-3 subprocess."""
+def _emit_lkh_message(heartbeat_emit: Optional[Callable[[str], None]], message: str) -> None:
+    if heartbeat_emit is not None:
+        heartbeat_emit(str(message))
+    else:
+        print(str(message))
+
+
+def run_lkh_with_status(
+    executable: str,
+    par_path: str,
+    timeout: Optional[float] = None,
+    heartbeat_sec: float = 0.0,
+    heartbeat_emit: Optional[Callable[[str], None]] = None,
+) -> LKHRunStatus:
+    """Execute LKH-3 subprocess and preserve timeout / heartbeat status."""
+    resolved_exe = resolve_lkh_executable(executable)
+    start_t = time.perf_counter()
+
+    if float(heartbeat_sec) > 0.0:
+        proc = subprocess.Popen(
+            [resolved_exe, par_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        next_heartbeat = start_t + max(float(heartbeat_sec), 1.0)
+
+        while True:
+            ret = proc.poll()
+            now = time.perf_counter()
+            elapsed = now - start_t
+            if ret is not None:
+                _stdout, stderr = proc.communicate()
+                if ret != 0:
+                    detail = stderr.strip() if stderr else ""
+                    suffix = f": {detail}" if detail else ""
+                    _emit_lkh_message(heartbeat_emit, f"[LKH Error] exit={ret}{suffix}")
+                return LKHRunStatus(
+                    ok=(ret == 0),
+                    timeout_hit=False,
+                    elapsed_sec=float(elapsed),
+                )
+
+            if timeout is not None and elapsed >= float(timeout):
+                proc.kill()
+                proc.communicate()
+                _emit_lkh_message(heartbeat_emit, f"[LKH Timeout] Exceeded {float(timeout):.1f}s")
+                return LKHRunStatus(
+                    ok=False,
+                    timeout_hit=True,
+                    elapsed_sec=float(elapsed),
+                )
+
+            if now >= next_heartbeat:
+                _emit_lkh_message(heartbeat_emit, f"LKH running... elapsed={elapsed:.1f}s")
+                next_heartbeat += float(heartbeat_sec)
+
+            time.sleep(1.0)
+
     try:
         resolved_exe = resolve_lkh_executable(executable)
+        start_t = time.perf_counter()
         result = subprocess.run(
             [resolved_exe, par_path],
             stdout=subprocess.PIPE,
@@ -157,13 +224,34 @@ def run_lkh(executable: str, par_path: str, timeout: Optional[float] = None):
         )
         if result.returncode != 0:
             print(f"[LKH Error] {result.stderr}")
-        return result.returncode == 0
+        return LKHRunStatus(
+            ok=(result.returncode == 0),
+            timeout_hit=False,
+            elapsed_sec=float(time.perf_counter() - start_t),
+        )
     except subprocess.TimeoutExpired:
         print(f"[LKH Timeout] Exceeded {timeout}s")
-        return False
+        return LKHRunStatus(ok=False, timeout_hit=True, elapsed_sec=float(time.perf_counter() - start_t))
     except Exception as e:
         print(f"[LKH System Error] {e}")
-        return False
+        return LKHRunStatus(ok=False, timeout_hit=False, elapsed_sec=float(time.perf_counter() - start_t))
+
+
+def run_lkh(
+    executable: str,
+    par_path: str,
+    timeout: Optional[float] = None,
+    heartbeat_sec: float = 0.0,
+    heartbeat_emit: Optional[Callable[[str], None]] = None,
+):
+    """Execute LKH-3 subprocess."""
+    return run_lkh_with_status(
+        executable,
+        par_path,
+        timeout=timeout,
+        heartbeat_sec=heartbeat_sec,
+        heartbeat_emit=heartbeat_emit,
+    ).ok
 
 def parse_tour(path: str) -> List[int]:
     """Parse LKH .tour file and return 0-indexed node order."""

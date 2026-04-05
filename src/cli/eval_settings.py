@@ -35,8 +35,6 @@ def resolve_eval_settings(
     default: Sequence[str],
     aliases: Mapping[str, str] | None = None,
     groups: Mapping[str, Sequence[str]] | None = None,
-    enable_exact: bool = False,
-    disable_guided_lkh: bool = False,
 ) -> list[str]:
     aliases = dict(aliases or {})
     groups = dict(groups or {})
@@ -67,16 +65,6 @@ def resolve_eval_settings(
         for item in expand(token):
             if item not in resolved:
                 resolved.append(item)
-
-    if enable_exact and "exact" in available_set and "exact" not in resolved:
-        if "greedy" in resolved:
-            insert_at = resolved.index("greedy") + 1
-            resolved.insert(insert_at, "exact")
-        else:
-            resolved.append("exact")
-
-    if disable_guided_lkh:
-        resolved = [item for item in resolved if item != "guided_lkh"]
 
     return resolved
 

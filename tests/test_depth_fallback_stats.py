@@ -40,7 +40,7 @@ def test_depth_fallback_stats_are_recorded():
     merge_enc.eval()
     merge_dec.eval()
 
-    runner = OnePassDPRunner(r=4, max_used=4, topk=5, fallback_exact=True)
+    runner = OnePassDPRunner(r=4, max_used=4, fallback_exact=True)
     result = runner.run_single(
         tokens=tokens,
         leaves=leaves,
@@ -59,7 +59,6 @@ def test_depth_fallback_stats_are_recorded():
     total = float(bucket["num_sigma_total"])
     classified = (
         float(bucket["num_parse_ok"])
-        + float(bucket["num_topk_ok"])
         + float(bucket["num_fallback"])
         + float(bucket["num_infeasible"])
     )

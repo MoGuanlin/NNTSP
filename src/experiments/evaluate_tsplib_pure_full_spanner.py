@@ -1,4 +1,4 @@
-# src/cli/evaluate_tsplib_pure_full_spanner.py
+# src/experiments/evaluate_tsplib_pure_full_spanner.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -6,9 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import shutil
-import subprocess
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,18 +23,16 @@ from src.cli.evaluate_tsplib import (
     sanitize_tag,
     select_tsplib_files,
 )
-from src.cli.evaluate_tsplib_compare import compute_gap_pct, tsplib_euc2d_length
+from src.experiments.evaluate_tsplib_compare import compute_gap_pct, tsplib_euc2d_length
 from src.cli.graph_pipeline import build_spanner_builder, preprocess_points_to_hierarchy
 from src.graph.build_raw_pyramid import RawPyramidBuilder
-from src.models.lkh_decode import TSPLIB_PAPER_RESULTS, build_uniform_spanner_candidates
-from src.utils.lkh_solver import (
-    default_lkh_executable,
-    parse_tour,
-    resolve_lkh_executable,
-    write_candidate_file,
-    write_par,
-    write_tsp_euc2d,
+from src.models.lkh_decode import (
+    TSPLIB_PAPER_RESULTS,
+    CandidateLKHConfig,
+    build_uniform_spanner_candidates,
+    run_candidate_lkh_timed,
 )
+from src.utils.lkh_solver import default_lkh_executable, resolve_lkh_executable
 
 
 def utc_now_iso() -> str:
@@ -124,50 +119,6 @@ def summarize(records: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[s
     }
 
 
-def run_lkh_with_heartbeat(
-    *,
-    executable: str,
-    par_path: str,
-    timeout: float | None,
-    heartbeat_sec: float,
-    prefix: str,
-) -> tuple[bool, bool, float]:
-    resolved_exe = resolve_lkh_executable(executable)
-    start_t = time.perf_counter()
-    proc = subprocess.Popen(
-        [resolved_exe, par_path],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    timeout_hit = False
-    next_heartbeat = start_t + max(float(heartbeat_sec), 1.0)
-
-    while True:
-        ret = proc.poll()
-        now = time.perf_counter()
-        elapsed = now - start_t
-        if ret is not None:
-            _stdout, stderr = proc.communicate()
-            if ret != 0 and stderr:
-                log_progress(prefix, f"LKH exited with code={ret}: {stderr.strip()[:200]}")
-            return ret == 0, timeout_hit, elapsed
-
-        if timeout is not None and elapsed >= float(timeout):
-            timeout_hit = True
-            proc.kill()
-            _stdout, _stderr = proc.communicate()
-            log_progress(prefix, f"LKH timeout after {elapsed:.1f}s")
-            return False, timeout_hit, elapsed
-
-        if heartbeat_sec > 0 and now >= next_heartbeat:
-            log_progress(prefix, f"LKH running... elapsed={elapsed:.1f}s")
-            next_heartbeat += float(heartbeat_sec)
-
-        time.sleep(1.0)
-
-
 def run_full_spanner_instance(
     *,
     points_cpu: torch.Tensor,
@@ -183,67 +134,44 @@ def run_full_spanner_instance(
     pos_cpu = points_cpu.detach().cpu()
     pos_np = pos_cpu.numpy()
     edge_index_cpu = spanner_edge_index.detach().cpu()
-
-    tmp_dir = tempfile.mkdtemp(prefix="pure_full_spanner_")
-    tsp_path = str(Path(tmp_dir) / "problem.tsp")
-    par_path = str(Path(tmp_dir) / "config.par")
-    tour_path = str(Path(tmp_dir) / "result.tour")
-    cand_path = str(Path(tmp_dir) / "candidates.cand")
-
-    start_t = time.perf_counter()
-    try:
-        write_tsp_euc2d(tsp_path, "PureFullSpanner", pos_np)
-        candidates = build_uniform_spanner_candidates(
-            num_nodes=int(pos_cpu.shape[0]),
-            edge_index=edge_index_cpu,
-            uniform_alpha=0,
-        )
-        write_candidate_file(cand_path, int(pos_cpu.shape[0]), list(candidates))
-        write_par(
-            par_path,
-            tsp_path,
-            tour_path,
-            runs=max(1, int(lkh_runs)),
-            seed=1234,
-            precision=1,
-            candidate_path=cand_path,
+    candidates = build_uniform_spanner_candidates(
+        num_nodes=int(pos_cpu.shape[0]),
+        edge_index=edge_index_cpu,
+        uniform_alpha=0,
+    )
+    result, lkh_break = run_candidate_lkh_timed(
+        pos=pos_cpu,
+        candidates=candidates,
+        initial_tour=None,
+        lkh_executable=lkh_exe,
+        num_runs=max(1, int(lkh_runs)),
+        seed=1234,
+        timeout=lkh_timeout,
+        mode="spanner_uniform",
+        candidate_config=CandidateLKHConfig(
             subgradient=True,
             max_candidates=0,
             max_trials=None,
-        )
-
-        ok, timeout_hit, lkh_elapsed = run_lkh_with_heartbeat(
-            executable=lkh_exe,
-            par_path=par_path,
-            timeout=lkh_timeout,
-            heartbeat_sec=heartbeat_sec,
-            prefix=prefix,
-        )
-        order = parse_tour(tour_path) if ok else []
-        feasible = len(order) == int(pos_cpu.shape[0]) and len(set(order)) == int(pos_cpu.shape[0])
-        if feasible:
-            total = 0.0
-            n = len(order)
-            for i in range(n):
-                u = int(order[i])
-                v = int(order[(i + 1) % n])
-                total += float(np.linalg.norm(pos_np[u] - pos_np[v]))
-            euclidean_length = total
-            obj = tsplib_euc2d_length(coords_np, list(order))
-        else:
-            euclidean_length = None
-            obj = None
-    finally:
-        duration = time.perf_counter() - start_t
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            use_initial_tour=False,
+        ),
+        heartbeat_sec=float(heartbeat_sec),
+        heartbeat_emit=lambda msg: log_progress(prefix, msg),
+    )
+    if result.feasible:
+        euclidean_length = float(result.length)
+        obj = tsplib_euc2d_length(coords_np, list(result.order))
+    else:
+        euclidean_length = None
+        obj = None
+    timeout_hit = bool(lkh_break.get("timeout_hit", False))
 
     return {
         "feasible": bool(obj is not None),
         "obj": (None if obj is None else float(obj)),
         "gap_pct": compute_gap_pct(obj, paper_obj),
-        "time_sec": float(duration if not timeout_hit else max(duration, lkh_elapsed)),
+        "time_sec": float(result.duration),
         "euclidean_length": (None if euclidean_length is None else float(euclidean_length)),
-        "order": ([] if obj is None else [int(x) for x in order]),
+        "order": ([] if obj is None else [int(x) for x in result.order]),
         "timeout_hit": bool(timeout_hit),
         "used_initial_tour": False,
         "subgradient": True,
@@ -295,7 +223,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     lkh_timeout = None if float(args.lkh_timeout) <= 0 else float(args.lkh_timeout)
-    print(f"[env] lkh_exe={Path(args.lkh_exe).resolve()}")
+    lkh_exe = resolve_lkh_executable(str(args.lkh_exe))
+    print(f"[env] lkh_exe={lkh_exe}")
     print(f"[env] lkh_timeout={lkh_timeout}")
     print(f"[data] Selected {selection_desc} from {len(all_tsp_files)} total.")
 
@@ -328,7 +257,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "spanner_mode": str(args.spanner_mode),
         "theta_k": int(args.theta_k),
         "patching_mode": str(args.patching_mode),
-        "lkh_exe": str(Path(args.lkh_exe).resolve()),
+        "lkh_exe": str(lkh_exe),
         "lkh_runs": int(args.lkh_runs),
         "lkh_timeout": lkh_timeout,
         "heartbeat_sec": float(args.heartbeat_sec),
@@ -395,7 +324,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             points_cpu=points_cpu,
             spanner_edge_index=data_cpu.spanner_edge_index.cpu(),
             coords_np=coords,
-            lkh_exe=str(args.lkh_exe),
+            lkh_exe=str(lkh_exe),
             lkh_runs=int(args.lkh_runs),
             lkh_timeout=lkh_timeout,
             paper_obj=paper_obj,
